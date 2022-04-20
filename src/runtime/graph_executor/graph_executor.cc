@@ -1,4 +1,6 @@
 /*
+ * Copyright 2022 EdgeCortix Inc
+ *
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -600,6 +602,11 @@ PackedFunc GraphExecutor::GetFunction(const std::string& name,
     return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
       this->LoadParams(args[0].operator std::string());
     });
+  } else if (name == "get_runtime_metrics") {
+    auto pf = module_.GetFunction("get_runtime_metrics", true);
+    CHECK(pf != nullptr);
+    return PackedFunc(
+        [sptr_to_self, pf](TVMArgs args, TVMRetValue* rv) { pf.CallPacked(args, rv); });
   } else if (name == "share_params") {
     return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
       const auto& module = args[0].operator Module();

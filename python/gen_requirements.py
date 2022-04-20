@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright 2022 EdgeCortix Inc.
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -67,6 +69,7 @@ REQUIREMENTS_BY_PIECE: RequirementsByPieceType = [
                 "attrs",
                 "cloudpickle",
                 "decorator",
+                "mera-tvm-internal",
                 "numpy",
                 "psutil",
                 "scipy",

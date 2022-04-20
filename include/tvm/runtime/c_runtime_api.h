@@ -1,4 +1,6 @@
 /*
+ * Copyright 2022 EdgeCortix Inc.
+ *
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -66,7 +68,7 @@
 #endif
 
 // TVM version
-#define TVM_VERSION "0.8.dev0"
+#define TVM_VERSION "1.0"
 
 // TVM Runtime is DLPack compatible.
 #include <dlpack/dlpack.h>

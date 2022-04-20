@@ -18,6 +18,10 @@ else()
   endif()
 endif()
 
+if(NOT DEFINED ENV{MERA_HOME})
+message(FATAL_ERROR "MERA_HOME environment has not been set.")
+endif()
+
 # NOTE: do not modify this file to change option values.
 # You can create a config.cmake at build folder
 # and add set(OPTION VALUE) to override these build options.
@@ -88,6 +92,8 @@ tvm_option(USE_TENSORRT_CODEGEN "Build with TensorRT Codegen support" OFF)
 tvm_option(USE_TENSORRT_RUNTIME "Build with TensorRT runtime" OFF)
 tvm_option(USE_RUST_EXT "Build with Rust based compiler extensions, STATIC, DYNAMIC, or OFF" OFF)
 tvm_option(USE_VITIS_AI "Build with VITIS-AI Codegen support" OFF)
+tvm_option(USE_MERADNA_CODEGEN "Build with Mera DNA codegen support" ON)
+tvm_option(LIBMERADNA_NAME "Name of libmeradna-MODE.ARCH.so to use" libmeradna-full.x86.so)
 
 # include directories
 include_directories(${CMAKE_INCLUDE_PATH})
@@ -97,6 +103,8 @@ include_directories(SYSTEM ${DMLC_PATH})
 include_directories(SYSTEM ${RANG_PATH})
 include_directories(SYSTEM ${COMPILER_RT_PATH})
 include_directories(SYSTEM ${PICOJSON_PATH})
+include_directories($ENV{MERA_HOME}/mera-dna/include)
+include_directories(3rdparty/libnop/include)
 
 # initial variables
 set(TVM_LINKER_LIBS "")
@@ -171,8 +179,8 @@ else(MSVC)
     set(CMAKE_CXX_FLAGS "-faligned-new ${CMAKE_CXX_FLAGS}")
   endif()
 
-  # ld option to warn if symbols are undefined (e.g. libtvm_runtime.so
-  # using symbols only present in libtvm.so).  Not needed for MSVC,
+  # ld option to warn if symbols are undefined (e.g. libmeratvm_runtime.so
+  # using symbols only present in libmeratvm.so).  Not needed for MSVC,
   # since this is already the default there.
   if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin" OR ${CMAKE_SYSTEM_NAME} MATCHES "iOS")
     set(TVM_NO_UNDEFINED_SYMBOLS "-Wl,-undefined,error")
@@ -432,6 +440,8 @@ include(cmake/modules/Git.cmake)
 include(cmake/modules/LibInfo.cmake)
 include(cmake/modules/RustExt.cmake)
 
+include(cmake/modules/contrib/MeraCodeGen.cmake)
+
 include(CheckCXXCompilerFlag)
 if(NOT MSVC)
   check_cxx_compiler_flag("-std=c++14" SUPPORT_CXX14)
@@ -452,10 +462,12 @@ add_library(tvm_runtime_objs OBJECT ${RUNTIME_SRCS})
 add_library(tvm_libinfo_objs OBJECT ${LIBINFO_FILE})
 
 add_library(tvm SHARED $<TARGET_OBJECTS:tvm_objs> $<TARGET_OBJECTS:tvm_runtime_objs> $<TARGET_OBJECTS:tvm_libinfo_objs>)
+set_target_properties(tvm PROPERTIES OUTPUT_NAME "meratvm")
 set_property(TARGET tvm APPEND PROPERTY LINK_OPTIONS "${TVM_NO_UNDEFINED_SYMBOLS}")
 set_property(TARGET tvm APPEND PROPERTY LINK_OPTIONS "${TVM_VISIBILITY_FLAG}")
 if(BUILD_STATIC_RUNTIME)
   add_library(tvm_runtime STATIC $<TARGET_OBJECTS:tvm_runtime_objs>)
+  set_target_properties(tvm_runtime PROPERTIES OUTPUT_NAME "meratvm_runtime")
   set(NOTICE_MULTILINE
     "You have build static version of the TVM runtime library. Make "
     "sure to use --whole-archive when linking it into your project.")
@@ -464,6 +476,7 @@ if(BUILD_STATIC_RUNTIME)
     COMMAND ${CMAKE_COMMAND} -E cmake_echo_color --yellow --bold ${NOTICE})
 else()
   add_library(tvm_runtime SHARED $<TARGET_OBJECTS:tvm_runtime_objs>)
+  set_target_properties(tvm_runtime PROPERTIES OUTPUT_NAME "meratvm_runtime")
   set_property(TARGET tvm_runtime APPEND PROPERTY LINK_OPTIONS "${TVM_NO_UNDEFINED_SYMBOLS}")
 endif()
 set_property(TARGET tvm_runtime APPEND PROPERTY LINK_OPTIONS "${TVM_VISIBILITY_FLAG}")
@@ -537,6 +550,14 @@ endif()
 
 target_link_libraries(tvm PRIVATE ${TVM_LINKER_LIBS} ${TVM_RUNTIME_LINKER_LIBS})
 target_link_libraries(tvm_runtime PRIVATE ${TVM_RUNTIME_LINKER_LIBS})
+
+# Set link with mera-dna rpath with relative path
+if(USE_MERADNA_CODEGEN STREQUAL "ON")
+  target_link_directories(tvm PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+  target_link_directories(tvm_runtime PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+  set_property(TARGET tvm APPEND PROPERTY LINK_FLAGS "-Wl,-rpath='\$ORIGIN:\$ORIGIN/../../../'")
+  set_property(TARGET tvm_runtime APPEND PROPERTY LINK_FLAGS "-Wl,-rpath='\$ORIGIN:\$ORIGIN/../../../'")
+endif()
 
 # Set flags for clang
 include(cmake/modules/ClangFlags.cmake)

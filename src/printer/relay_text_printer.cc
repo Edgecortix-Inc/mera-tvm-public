@@ -1,4 +1,6 @@
 /*
+ * Copyright 2022 EdgeCortix Inc
+ *
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -877,7 +879,9 @@ std::vector<Doc> RelayTextPrinter::PrintFuncAttrs(const Attrs& attrs) {
   ICHECK(dict_attrs);
   for (const auto& k : dict_attrs->dict) {
     Doc doc;
-    doc << k.first << "=" << Print(k.second);
+    if (k.second.defined()) {
+      doc << k.first << "=" << Print(k.second);
+    }
     docs.push_back(doc);
   }
   return docs;

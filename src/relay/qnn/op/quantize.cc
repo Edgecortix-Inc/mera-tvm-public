@@ -1,4 +1,6 @@
 /*
+ * Copyright 2022 EdgeCortix Inc
+ *
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -27,6 +29,7 @@
 #include <tvm/relay/op_attr_types.h>
 #include <tvm/relay/qnn/attrs.h>
 
+#include "../../transforms/infer_layout_utils.h"
 #include "../../transforms/pattern_utils.h"
 #include "../utils.h"
 
@@ -148,6 +151,41 @@ Expr QuantizeQnnCanonicalize(const Attrs& attrs, const Array<Expr>& new_args,
   return QuantizeLower(data, output_scale, output_zero_point, types, quantize_attrs);
 }
 
+inline InferCorrectLayoutOutput QuantizeInferLayout(const Attrs& attrs,
+                                                const Array<Layout>& new_in_layouts,
+                                                const Array<Layout>& old_in_layouts,
+                                                const Array<tvm::relay::Type>& old_in_types) {
+  Layout ret;
+
+  if (new_in_layouts.defined()) {
+    CHECK_GE(new_in_layouts.size(), 1);
+    ret = new_in_layouts[0];
+
+  } else {
+    for (size_t i = 0; i < old_in_layouts.size(); ++i) {
+      if (old_in_layouts[i].defined()) {
+        ret = old_in_layouts[i];
+        break;
+      }
+    }
+  }
+
+  QuantizeAttrs* params = const_cast<QuantizeAttrs*>(attrs.as<QuantizeAttrs>());
+  CHECK(params);
+
+  if (ret.name() == "NCHW" && params->axis != 1) {
+    params->axis = 1;
+  } else if (ret.name() == "NHWC" && params->axis != 3) {
+    params->axis = 3;
+  }
+
+  Array<Layout> in_layout;
+  in_layout.push_back(ret);
+  in_layout.push_back(Layout("NCHW"));  // scalar
+  in_layout.push_back(Layout("NCHW"));  // scalar
+  return InferCorrectLayoutOutput(in_layout, {ret}, attrs);
+}
+
 RELAY_REGISTER_OP("qnn.quantize")
     .describe(R"code(Quantizes the input and produces quantized output.
 The input can be either float or quantized(int8, unit8). If the input is float,
@@ -168,6 +206,7 @@ scale and zero point.
     .set_support_level(11)
     .add_type_rel("Quantize", QuantizeRel)
     .set_attr<TNonComputational>("TNonComputational", true)
+    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", QuantizeInferLayout)
     .set_attr<FTVMLegalize>("FTVMQnnCanonicalize", QuantizeQnnCanonicalize);
 
 TVM_REGISTER_GLOBAL("relay.qnn.op._make.quantize").set_body_typed(MakeQuantize);

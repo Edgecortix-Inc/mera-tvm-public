@@ -1,4 +1,6 @@
 /*
+ * Copyright 2022 EdgeCortix Inc
+ *
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -28,6 +30,7 @@
 #include <tvm/relay/qnn/attrs.h>
 
 #include "../../transforms/pattern_utils.h"
+#include "../../transforms/infer_layout_utils.h"
 #include "../utils.h"
 
 namespace tvm {
@@ -140,6 +143,31 @@ Expr DequantizeQnnCanonicalize(const Attrs& attrs, const Array<Expr>& new_args,
   return DequantizeLower(data, input_scale, input_zero_point, types, dequantize_attrs);
 }
 
+inline InferCorrectLayoutOutput DequantizeInferLayout(const Attrs& attrs,
+                                                  const Array<Layout>& new_in_layouts,
+                                                  const Array<Layout>& old_in_layouts,
+                                                  const Array<tvm::relay::Type>& old_in_types) {
+  Layout ret;
+
+  if (new_in_layouts.defined()) {
+    CHECK_GE(new_in_layouts.size(), 1);
+    ret = new_in_layouts[0];
+  } else {
+    for (size_t i = 0; i < old_in_layouts.size(); ++i) {
+      if (old_in_layouts[i].defined()) {
+        ret = old_in_layouts[i];
+        break;
+      }
+    }
+  }
+
+  Array<Layout> in_layout;
+  in_layout.push_back(ret);
+  in_layout.push_back(Layout("NCHW")); // scalar
+  in_layout.push_back(Layout("NCHW")); // scalar
+  return InferCorrectLayoutOutput(in_layout, {ret}, attrs);
+}
+
 RELAY_REGISTER_OP("qnn.dequantize")
     .describe(R"code(Dequantizes the input and produces float32 output.
 The input is always quantized (int8, uint8) and will be converted to float32 given input scale and zero_point.
@@ -153,9 +181,11 @@ The input is always quantized (int8, uint8) and will be converted to float32 giv
     .set_support_level(11)
     .add_type_rel("Dequantize", DequantizeRel)
     .set_attr<TNonComputational>("TNonComputational", true)
-    .set_attr<FTVMLegalize>("FTVMQnnCanonicalize", DequantizeQnnCanonicalize);
+    .set_attr<FTVMLegalize>("FTVMQnnCanonicalize", DequantizeQnnCanonicalize)
+    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", DequantizeInferLayout);
 
 TVM_REGISTER_GLOBAL("relay.qnn.op._make.dequantize").set_body_typed(MakeDequantize);
+
 
 }  // namespace qnn
 }  // namespace relay
