@@ -1,3 +1,5 @@
+# Copyright 2022 EdgeCortix Inc.
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -458,14 +460,17 @@ def dense_strategy_cpu(attrs, inputs, out_type, target):
         wrap_compute_dense(topi.x86.dense_nopack),
         wrap_topi_schedule(topi.x86.schedule_dense_nopack),
         name="dense_nopack.x86",
-        plevel=5,
+        plevel=10,
     )
 
+    # priority level exchanged between nopack and pack,
+    # giving more priority to nopack because it gives us
+    # better performance for our current workloads
     strategy.add_implementation(
         wrap_compute_dense(topi.x86.dense_pack),
         wrap_topi_schedule(topi.x86.schedule_dense_pack),
         name="dense_pack.x86",
-        plevel=10,
+        plevel=5,
     )
 
     if is_auto_scheduler_enabled():

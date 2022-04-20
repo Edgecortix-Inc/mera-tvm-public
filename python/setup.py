@@ -1,3 +1,5 @@
+# Copyright 2022 EdgeCortix Inc.
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -21,6 +23,9 @@ import shutil
 import sys
 import sysconfig
 import platform
+import glob
+import pathlib
+import re
 
 from setuptools import find_packages
 from setuptools.dist import Distribution
@@ -150,6 +155,35 @@ if not CONDA_BUILD:
 
 setup_kwargs = {}
 
+
+def get_package_data_files():
+    # Relay standard libraries
+    return ["relay/std/prelude.rly", "relay/std/core.rly"]
+
+class _MeraTvmPackageType:
+    def __init__(self, name):
+        self.name = name
+
+MODES = {
+    "host-only" : _MeraTvmPackageType('host-only'),
+    "runtime" : _MeraTvmPackageType('runtime'),
+    "full" : _MeraTvmPackageType('full')
+}
+
+dist_mode = os.environ["MERA_TVM_DIST_MODE"]
+if dist_mode not in MODES:
+    raise ValueError(f'Unknown distribution mode {dist_mode}. Can only be ({", ".join(MODES.keys())})')
+tvm_mode : _MeraTvmPackageType = MODES[dist_mode]
+
+if not os.environ.get("MERA_TVM_DIST_MODE", None):
+    raise ValueError(f'Missing environment variable MERA_TVM_DIST_MODE ({", ".join(MODES.keys())})')
+if not os.environ.get("MERA_HOME", None):
+    raise ValueError(f'Missing environment variable MERA_HOME')
+_IS_ARM = any([bool(re.match(r"--plat-name=.*_aarch64", a)) for a in sys.argv])
+_arch = 'aarch64' if _IS_ARM else 'x86'
+
+MERA_DNA_LIBS = glob.glob(f'{os.environ["MERA_HOME"]}/lib/libmeradna-{tvm_mode.name}.{_arch}*')
+
 # For bdist_wheel only
 if wheel_include_libs:
     with open("MANIFEST.in", "w") as fo:
@@ -157,6 +191,11 @@ if wheel_include_libs:
             shutil.copy(path, os.path.join(CURRENT_DIR, "tvm"))
             _, libname = os.path.split(path)
             fo.write("include tvm/%s\n" % libname)
+        for path in MERA_DNA_LIBS:
+            shutil.copy(path, os.path.join(CURRENT_DIR, "tvm"))
+            fo.write(f"include tvm/{os.path.basename(path)}\n")
+        for pkg_data in get_package_data_files():
+            fo.write(f"include tvm/{pkg_data}\n")
     setup_kwargs = {"include_package_data": True}
 
 if include_libs:
@@ -164,11 +203,6 @@ if include_libs:
     for i, path in enumerate(LIB_LIST):
         LIB_LIST[i] = os.path.relpath(path, curr_path)
     setup_kwargs = {"include_package_data": True, "data_files": [("tvm", LIB_LIST)]}
-
-
-def get_package_data_files():
-    # Relay standard libraries
-    return ["relay/std/prelude.rly", "relay/std/core.rly"]
 
 
 # Temporarily add this directory to the path so we can import the requirements generator
@@ -183,19 +217,27 @@ extras_require = {
     piece: deps for piece, (_, deps) in requirements.items() if piece not in ("all", "core")
 }
 
+
+PKG_NAME = f'mera-tvm-{tvm_mode.name}'
+
+mera_tvm_version = __version__
+version_local = os.environ.get("MERA_TVM_LOCAL_VERSION", None)
+if version_local:
+    mera_tvm_version += f'+{version_local}'
+
 setup(
-    name="tvm",
-    version=__version__,
-    description="TVM: An End to End Tensor IR/DSL Stack for Deep Learning Systems",
+    name=PKG_NAME,
+    version=mera_tvm_version,
+    description="Mera TVM: An End to End Tensor IR/DSL Stack for Deep Learning Systems, adapted to Mera (https://github.com/Edgecortix-Inc/mera) environment.",
     zip_safe=False,
     entry_points={"console_scripts": ["tvmc = tvm.driver.tvmc.main:main"]},
     install_requires=requirements["core"][1],
     extras_require=extras_require,
     packages=find_packages(),
-    package_dir={"tvm": "tvm"},
-    package_data={"tvm": get_package_data_files()},
+    package_dir={PKG_NAME: "tvm"},
+    package_data={PKG_NAME: get_package_data_files()},
     distclass=BinaryDistribution,
-    url="https://github.com/apache/tvm",
+    url="https://github.com/Edgecortix-Inc/mera-tvm",
     ext_modules=config_cython(),
     **setup_kwargs,
 )
@@ -207,3 +249,5 @@ if wheel_include_libs:
     for path in LIB_LIST:
         _, libname = os.path.split(path)
         os.remove("tvm/%s" % libname)
+    for path in MERA_DNA_LIBS:
+        os.remove(f"tvm/{os.path.basename(path)}")

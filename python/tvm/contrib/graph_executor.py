@@ -1,3 +1,5 @@
+# Copyright 2022 EdgeCortix Inc.
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -161,6 +163,7 @@ class GraphModule(object):
         self._get_num_inputs = module["get_num_inputs"]
         self._load_params = module["load_params"]
         self._share_params = module["share_params"]
+        self._get_runtime_metrics = None
 
     def set_input(self, key=None, value=None, **params):
         """Set inputs to the module via kwargs
@@ -407,3 +410,27 @@ class GraphModule(object):
         return self.module.time_evaluator(
             func_name, device, repeat=repeat, number=number, min_repeat_ms=min_repeat_ms
         )()
+
+    def get_elapsed_latency(self):
+        '''
+        Compatibility function, see get_runtime_metrics()
+        '''
+        return sum([x.get('elapsed_latency', 0) for x in self.get_runtime_metrics()])
+
+    def get_runtime_metrics(self):
+        '''
+        Fetches all computed runtime profiling metrics dependent on the target.
+        '''
+        if not self._get_runtime_metrics:
+            # lazy init
+            self._get_runtime_metrics = self.module["get_runtime_metrics"]
+        # Assemble metrics object
+        metrics_raw = self._get_runtime_metrics()
+        metrics = []
+        for m_obj in metrics_raw.split('|')[:-1] if len(metrics_raw) > 0 else []:
+            metric = {}
+            for m in m_obj.split(',') if len(m_obj) > 0 else []:
+                k, v = m.split('=')
+                metric[k] = int(v)
+            metrics.append(metric)
+        return metrics

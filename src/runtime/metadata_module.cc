@@ -1,4 +1,6 @@
 /*
+ * Copyright 2022 EdgeCortix Inc
+ *
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -71,6 +73,23 @@ class MetadataModuleNode : public ModuleNode {
     // Normally we would only have a limited number of submodules. The runtime
     // symobl lookup overhead should be minimal.
     ICHECK(!this->imports().empty());
+
+    if (name == "get_runtime_metrics") {
+      return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
+        std::stringstream metric_str;
+        for (Module it : this->imports()) {
+          TVMRetValue it_ret;
+          auto pf = it.GetFunction("get_runtime_metrics");
+          if (pf != nullptr) {
+            pf.CallPacked(args, &it_ret);
+            std::string mod_metric = it_ret;
+            metric_str << mod_metric << '|';
+          }
+        }
+        *rv = metric_str.str();
+      });
+    }
+
     for (Module it : this->imports()) {
       PackedFunc pf = it.GetFunction(name);
       if (pf != nullptr) return pf;

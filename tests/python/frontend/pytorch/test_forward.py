@@ -835,6 +835,7 @@ def test_forward_split():
             return torch.split(args[0], self.split_size_or_sections, self.dim)
 
     input_data = torch.rand(input_shape).float()
+
     verify_model(Split(2, 0).float().eval(), input_data=input_data)
     verify_model(Split(3, 1).float().eval(), input_data=input_data)
     verify_model(Split(4, 1).float().eval(), input_data=input_data)

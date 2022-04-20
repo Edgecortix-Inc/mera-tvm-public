@@ -1,3 +1,5 @@
+# Copyright 2022 EdgeCortix Inc.
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -114,18 +116,18 @@ def find_lib_path(name=None, search_path=None, optional=False):
         runtime_dll_path = []
     else:
         if sys.platform.startswith("win32"):
-            lib_dll_path = [os.path.join(p, "libtvm.dll") for p in dll_path] + [
-                os.path.join(p, "tvm.dll") for p in dll_path
+            lib_dll_path = [os.path.join(p, "libmeratvm.dll") for p in dll_path] + [
+                os.path.join(p, "meratvm.dll") for p in dll_path
             ]
-            runtime_dll_path = [os.path.join(p, "libtvm_runtime.dll") for p in dll_path] + [
-                os.path.join(p, "tvm_runtime.dll") for p in dll_path
+            runtime_dll_path = [os.path.join(p, "libmeratvm_runtime.dll") for p in dll_path] + [
+                os.path.join(p, "meratvm_runtime.dll") for p in dll_path
             ]
         elif sys.platform.startswith("darwin"):
-            lib_dll_path = [os.path.join(p, "libtvm.dylib") for p in dll_path]
-            runtime_dll_path = [os.path.join(p, "libtvm_runtime.dylib") for p in dll_path]
+            lib_dll_path = [os.path.join(p, "libmeratvm.dylib") for p in dll_path]
+            runtime_dll_path = [os.path.join(p, "libmeratvm_runtime.dylib") for p in dll_path]
         else:
-            lib_dll_path = [os.path.join(p, "libtvm.so") for p in dll_path]
-            runtime_dll_path = [os.path.join(p, "libtvm_runtime.so") for p in dll_path]
+            lib_dll_path = [os.path.join(p, "libmeratvm.so") for p in dll_path]
+            runtime_dll_path = [os.path.join(p, "libmeratvm_runtime.so") for p in dll_path]
 
     if not use_runtime:
         # try to find lib_dll_path
@@ -220,4 +222,4 @@ def find_include_path(name=None, search_path=None, optional=False):
 # We use the version of the incoming release for code
 # that is under development.
 # The following line is set by tvm/python/update_version.py
-__version__ = "0.8.dev0"
+__version__ = "1.0"

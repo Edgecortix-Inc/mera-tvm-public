@@ -1,3 +1,5 @@
+# Copyright 2022 EdgeCortix Inc.
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -52,29 +54,20 @@ def convert_qnn_conv2d(attrs, inputs, tinfos, desired_layouts):
     assert desired_data_layout != "default", "Data layout cannot be default"
 
     new_attrs = dict(attrs)
-    new_attrs["data_layout"] = desired_data_layout
 
-    if desired_kernel_layout != "default":
-        new_attrs["kernel_layout"] = desired_kernel_layout
+    # Below is different from upstream
+    # Be careful when doing upstream merge!
+    if desired_data_layout == "NHWC":
+        new_attrs["data_layout"] = "NHWC"
+        new_attrs["kernel_layout"] = "OIHW"
         return relay.qnn.op.conv2d(*inputs, **new_attrs)
 
     if desired_data_layout == "NCHW":
-        new_attrs["kernel_layout"] = "OIHW"
-        return relay.qnn.op.conv2d(*inputs, **new_attrs)
-    if desired_data_layout == "NHWC":
-        # Check for depthwise convolution.
-        data_info = tinfos[0]
-        weight_info = tinfos[1]
-        if is_depthwise_conv2d(
-            data_info.shape,
-            attrs["data_layout"],
-            weight_info.shape,
-            attrs["kernel_layout"],
-            attrs["groups"],
-        ):
-            new_attrs["kernel_layout"] = "HWOI"
+        if desired_kernel_layout != "default":
+            new_attrs["kernel_layout"] = desired_kernel_layout
         else:
-            new_attrs["kernel_layout"] = "HWIO"
+            new_attrs["kernel_layout"] = "OIHW"
+        new_attrs["data_layout"] = desired_data_layout
         return relay.qnn.op.conv2d(*inputs, **new_attrs)
 
     raise ValueError("Layout %s is not yet supported" % desired_data_layout)

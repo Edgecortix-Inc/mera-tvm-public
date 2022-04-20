@@ -15,6 +15,10 @@
 <!--- specific language governing permissions and limitations -->
 <!--- under the License. -->
 
+Mera-TVM-public is a fork of TVM that includes EdgeCortix Inc. maintained extentions and EdgeCortix MERA specific features added on top of the upstream codebase of Apache TVM.
+
+Original up-to-date TVM codebase is available [here](https://github.com/apache/tvm)
+
 <img src=https://raw.githubusercontent.com/apache/tvm-site/main/images/logo/tvm-logo-small.png width=128/> Open Deep Learning Compiler Stack
 ==============================================
 [Documentation](https://tvm.apache.org/docs) |

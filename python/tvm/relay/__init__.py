@@ -1,3 +1,5 @@
+# Copyright 2022 EdgeCortix Inc.
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -62,6 +64,8 @@ from .scope_builder import ScopeBuilder
 
 # Load Memory Passes
 from .transform import memory_plan
+
+from . import mera
 
 # Required to traverse large programs
 setrecursionlimit(10000)

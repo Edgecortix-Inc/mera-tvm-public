@@ -1,3 +1,5 @@
+# Copyright 2022 EdgeCortix Inc.
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -25,6 +27,7 @@ from tvm import relay
 from tvm.relay import expr as _expr
 from tvm.relay import op as _op
 from tvm.relay.frontend.common import infer_shape
+from .pytorch_util import is_channel_concat, map_axis
 
 from .pytorch_utils import is_version_greater_than
 
@@ -357,6 +360,8 @@ def add_input_quant_params_to_op_inputs(graph):
         "aten::upsample_bilinear2d": 1,
         "aten::relu_": 1,
         "aten::relu": 1,
+        "aten::leaky_relu": 1,
+        "aten::leaky_relu_": 1,
         "quantized::add_scalar": 1,
         "quantized::mul_scalar": 1,
         "quantized::relu6": 1,
@@ -416,30 +421,46 @@ def apply_with_upcast(data, func):
     return _op.cast(out, "uint8")
 
 
-def quantized_mean(data, input_scale, input_zero_point, func_fp32):
+def quantized_mean(data, input_scale, input_zero_point, func_fp32, layout="NCHW"):
     # refer to aten/src/ATen/native/quantized/cpu/qreduction.cpp
     dequantized = relay.qnn.op.dequantize(data, input_scale, input_zero_point)
     out = func_fp32(dequantized)
-    return relay.qnn.op.quantize(out, input_scale, input_zero_point, out_dtype="uint8", axis=1)
+    axis = 1 if layout == "NCHW" else -1
+    return relay.qnn.op.quantize(out, input_scale, input_zero_point, out_dtype="uint8", axis=axis)
 
 
-def quantized_upsample(data, input_scale, input_zero_point, func_fp32):
+def quantized_upsample(data, input_scale, input_zero_point, func_fp32, layout="NCHW"):
     # currently piggy backs to fp32, it gets identical output as torch
     data = relay.qnn.op.dequantize(data, input_scale, input_zero_point)
     out = func_fp32(data)
-    return relay.qnn.op.quantize(out, input_scale, input_zero_point, out_dtype="uint8", axis=1)
+    axis = 1 if layout == "NCHW" else 3
+    return relay.qnn.op.quantize(out, input_scale, input_zero_point, out_dtype="uint8", axis=axis)
 
 
 def quantized_relu(data, input_zero_point):
     # refer to aten/src/ATen/native/quantized/cpu/qrelu.cpp
-    zp = _op.cast(input_zero_point, dtype="uint8")
-    return _op.tensor.maximum(data, zp)
+    zp = _get_scalar(input_zero_point)
+    return _op.tensor.clip(data, zp, 255)
 
 
-def _quantize_per_tensor():
+def quantized_leaky_relu(data, input_scale, input_zero_point, func_fp32, layout="NCHW"):
+    # currently piggy backs to fp32, it gets identical output as torch
+    data = relay.qnn.op.dequantize(data, input_scale, input_zero_point)
+    out = func_fp32(data)
+    axis = 1 if layout == "NCHW" else 3
+    return relay.qnn.op.quantize(out, input_scale, input_zero_point, out_dtype="uint8", axis=axis)
+
+
+def _quantize_per_tensor(layout="NCHW"):
     def _impl(inputs, _):
+        if layout == "NHWC":
+            axis = 3
+        elif layout == "NCHW":
+            axis = 1
+        else:
+            assert False, "unsupported layout"
         return relay.qnn.op.quantize(
-            inputs[0], _expr.const(inputs[1]), _expr.const(inputs[2]), out_dtype="uint8", axis=1
+            inputs[0], _expr.const(inputs[1]), _expr.const(inputs[2]), out_dtype="uint8", axis=axis
         )
 
     return _impl
@@ -464,7 +485,14 @@ def _get_scalar(relay_const_scalar):
 
 
 def _do_bias_and_requantize(
-    output, bias, input_scale, weight_scale, output_scale, output_zero_point, with_relu
+    output,
+    bias,
+    input_scale,
+    weight_scale,
+    output_scale,
+    output_zero_point,
+    with_relu,
+    layout="NCHW",
 ):
     """Output processing for conv and linear"""
     # this is a vector for per channel case
@@ -477,11 +505,24 @@ def _do_bias_and_requantize(
     # for tvm because bias quantization can be done at compile time
     # Instead, the torch way requires rounding of activation at runtime
 
+    if layout == "NCHW":
+        c_axis = 1
+        bias_add = _op.nn.bias_add
+    else:
+        c_axis = 3
+
+        def _bias_add(conv, bias):
+            ex1 = _op.expand_dims(bias, axis=1, num_newaxis=2)
+            ex2 = _op.expand_dims(ex1, axis=0)
+            return _op.add(conv, _op.layout_transform(ex2, src_layout="NCHW", dst_layout="NHWC"))
+
+        bias_add = _bias_add
+
     if bias is not None:
         qbias = relay.qnn.op.quantize(
             bias, requant_input_scale, _expr.const(0, "int32"), out_dtype="int32", axis=0
         )
-        requantize_input = _op.nn.bias_add(output, qbias)
+        requantize_input = bias_add(output, qbias)
     else:
         requantize_input = output
 
@@ -492,8 +533,9 @@ def _do_bias_and_requantize(
         output_scale,
         output_zero_point,
         out_dtype="int32",
-        axis=1,
+        axis=c_axis,
     )
+
     clip_min = 0
     if with_relu:
         clip_min = _get_scalar(output_zero_point)
@@ -502,7 +544,7 @@ def _do_bias_and_requantize(
     return _op.cast(clip, dtype="uint8")
 
 
-def _quantized_conv2d(with_relu=False):
+def _quantized_conv2d(with_relu=False, layout="NCHW"):
     def _impl(inputs, _):
         # refer to src/ATen/native/quantized/cpu/qconv.cpp
         # inputs[0]: input tensor
@@ -548,14 +590,27 @@ def _quantized_conv2d(with_relu=False):
             input_zero_point = _expr.const(inputs[9])
 
         weight_shape = infer_shape(weight)
-        kernel_size = (weight_shape[2], weight_shape[3])
         out_channels = weight_shape[0]
+        kernel_size = (weight_shape[2], weight_shape[3])
+
+        if layout == "NCHW":
+            kernel_layout = "OIHW"
+            pad_width = ((0, 0), (0, 0), (padding[0], padding[0]), (padding[1], padding[1]))
+        else:
+            kernel_layout = "HWOI"
+            pad_width = (
+                (0, 0),
+                (padding[0], padding[0]),
+                (padding[1], padding[1]),
+                (0, 0),
+            )
+            weight = relay.layout_transform(weight, src_layout="OIHW", dst_layout="HWOI")
 
         if padding[0] != 0 or padding[1] != 0:
             pad_val = _get_scalar(input_zero_point)
             inp = _op.nn.pad(
                 inputs[0],
-                pad_width=((0, 0), (0, 0), (padding[0], padding[0]), (padding[1], padding[1])),
+                pad_width=pad_width,
                 pad_value=float(pad_val),
             )
         else:
@@ -576,10 +631,19 @@ def _quantized_conv2d(with_relu=False):
             padding=(0, 0),
             groups=groups,
             channels=out_channels,
+            data_layout=layout,
+            kernel_layout=kernel_layout,
         )
 
         return _do_bias_and_requantize(
-            conv_out, bias, input_scale, weight_scale, output_scale, output_zero_point, with_relu
+            conv_out,
+            bias,
+            input_scale,
+            weight_scale,
+            output_scale,
+            output_zero_point,
+            with_relu,
+            layout=layout,
         )
 
     return _impl
@@ -712,7 +776,7 @@ def _binop(relay_op, with_relu=False, fp32_piggy_back=False):
     return _impl
 
 
-def _cat(fp32_piggy_back=False):
+def _cat(layout="NCHW", fp32_piggy_back=False):
     # refer to aten/src/ATen/native/quantized/cpu/qconcat.cpp
     # for concat they also piggy backs to fp32(!)
     # dequantize -> fp32 math -> quantize
@@ -728,6 +792,11 @@ def _cat(fp32_piggy_back=False):
 
     def _impl(inputs, _):
         axis = inputs[1]
+
+        if layout == "NHWC" and is_channel_concat(inputs[0]):
+            axis = map_axis(axis, layout)
+
+        # axis = 3
         output_scale = _expr.const(inputs[2])
         output_zero_point = _expr.const(inputs[3])
         num_inputs = (len(inputs) - 4) // 2
@@ -753,7 +822,7 @@ def _cat(fp32_piggy_back=False):
 
 def _add_scalar():
     # this is used for mobilenet v3
-    def _impl(inputs, _):
+    def _torch_impl(inputs, _):
         # refer to aten/src/ATen/native/quantized/cpu/qadd.cpp
         assert len(inputs) == 6, "Input quant params not found in op inputs"
         s = inputs[4]
@@ -775,6 +844,39 @@ def _add_scalar():
             return relay.qnn.op.quantize(
                 dequantized_add, out_scale, out_zp, axis=1, out_dtype="uint8"
             )
+        # only scale change
+        return inputs[0]
+
+    def _impl(inputs, _):
+        assert len(inputs) == 6, "Input quant params not found in op inputs"
+        input_scale = inputs[4]
+        input_zero_point = inputs[5]
+        rhs_scalar = inputs[1]
+        rhs_scalar_q = round(rhs_scalar / input_scale)
+        q_min = 0
+        q_max = 255
+
+        # math for calculating output scale and zp are already done
+        # during _add_output_quant_params_to_scalar_op above
+        output_scale = inputs[2]
+        output_zero_point = inputs[3]
+
+        diff = input_zero_point - rhs_scalar_q
+        if q_min > diff or q_max < diff:
+            lhs = relay.qnn.op.requantize(
+                inputs[0],
+                _expr.const(input_scale),
+                _expr.const(input_zero_point),
+                _expr.const(output_scale),
+                _expr.const(output_zero_point),
+                out_dtype="int32",
+                axis=1,
+            )
+            rhs = quantize_scalar(rhs_scalar, output_scale, output_zero_point)
+            add = relay.add(lhs, _expr.const(rhs - output_zero_point, dtype="int32"))
+            clip = relay.clip(add, 0, 255)
+            return relay.cast(clip, "uint8")
+
         # only scale change
         return inputs[0]
 
@@ -924,21 +1026,23 @@ def _linear_dynamic():
     return _impl
 
 
-convert_map = {
-    "aten::quantize_per_tensor": _quantize_per_tensor(),
-    "quantized::conv2d_relu": _quantized_conv2d(with_relu=True),
-    "aten::dequantize": _dequantize(),
-    "quantized::conv2d": _quantized_conv2d(),
-    "quantized::add_relu": _binop(relay.qnn.op.add, with_relu=True),
-    "quantized::add": _binop(relay.qnn.op.add),
-    "quantized::mul_relu": _binop(relay.qnn.op.mul, with_relu=True),
-    "quantized::mul": _binop(relay.qnn.op.mul),
-    "quantized::linear": _linear(),
-    "quantized::linear_relu": _linear(with_relu=True),
-    "quantized::cat": _cat(),
-    "quantized::add_scalar": _add_scalar(),
-    "quantized::mul_scalar": _mul_scalar(),
-    "quantized::relu6": _relu6(),
-    "quantized::linear_dynamic": _linear_dynamic(),
-    "quantized::hardswish": _hswish(),
-}
+def get_convert_map(layout="NCHW"):
+    convert_map = {
+        "aten::quantize_per_tensor": _quantize_per_tensor(layout=layout),
+        "quantized::conv2d_relu": _quantized_conv2d(with_relu=True, layout=layout),
+        "aten::dequantize": _dequantize(),
+        "quantized::conv2d": _quantized_conv2d(layout=layout),
+        "quantized::add_relu": _binop(relay.qnn.op.add, with_relu=True),
+        "quantized::add": _binop(relay.qnn.op.add),
+        "quantized::mul_relu": _binop(relay.qnn.op.mul, with_relu=True),
+        "quantized::mul": _binop(relay.qnn.op.mul),
+        "quantized::linear": _linear(),
+        "quantized::linear_relu": _linear(with_relu=True),
+        "quantized::cat": _cat(layout=layout),
+        "quantized::add_scalar": _add_scalar(),
+        "quantized::mul_scalar": _mul_scalar(),
+        "quantized::relu6": _relu6(),
+        "quantized::linear_dynamic": _linear_dynamic(),
+        "quantized::hardswish": _hswish(),
+    }
+    return convert_map

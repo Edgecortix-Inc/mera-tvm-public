@@ -1,3 +1,5 @@
+# Copyright 2022 EdgeCortix Inc.
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -1192,6 +1194,23 @@ def AnnotateSpans():
         The registered AnnotateSpans pass.
     """
     return _ffi_api.AnnotateSpans()
+
+
+# Mera specifc passes
+def SwapPadLayoutTransform():
+    return _ffi_api.SwapPadLayoutTransform()
+
+
+def RemoveInputQuantize():
+    return _ffi_api.RemoveInputQuantize()
+
+
+def InlineExternClip():
+    return _ffi_api.InlineExternClip()
+
+
+def InsertResize(new_in_height, new_in_width):
+    return _ffi_api.InsertResize(new_in_height, new_in_width)
 
 
 def FakeQuantizationToInteger():

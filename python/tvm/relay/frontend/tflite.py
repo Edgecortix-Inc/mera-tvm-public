@@ -1,3 +1,5 @@
+# Copyright 2022 EdgeCortix Inc.
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -1531,8 +1533,10 @@ class OperatorConverter(object):
         input_tensors = self.get_input_tensors(op)
         assert len(input_tensors) == 2, "input tensors length should be 2"
 
-        for t in input_tensors:
-            assert not t.qnn_params, "Quantized input is not expected."
+        # The operator doesn't depend on quantization parameters
+        # This check is not necessary
+        #for t in input_tensors:
+        #    assert not t.qnn_params, "Quantized input is not expected."
 
         data = self.get_tensor_expr(input_tensors[0])
         indices = self.get_tensor_expr(input_tensors[1])

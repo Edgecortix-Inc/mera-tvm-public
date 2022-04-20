@@ -1,3 +1,5 @@
+# Copyright 2022 EdgeCortix Inc.
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -37,6 +39,7 @@ from .. import qnn, transform
 from ..expr_functor import ExprMutator
 from ..loops import while_loop
 from ..prelude import Prelude, StaticTensorArrayOps
+from .pytorch_util import is_channel_concat, map_axis
 from ..ty import Any, TensorType, TupleType
 from . import qnn_torch
 from .common import AttrCvt, get_relay_op, unbind, lstm_cell, gru_cell
@@ -135,11 +138,12 @@ def _is_int_seq(seq):
 class PyTorchOpConverter:
     """A helper class for holding PyTorch op converters."""
 
-    def __init__(self, prelude, default_dtype):
+    def __init__(self, prelude, default_dtype, layout):
         self.prelude = prelude
         self.default_dtype = default_dtype
         self.create_convert_map()
         self.types = {}  # map from nodes to (Relay) type annotations
+        self.layout = layout
 
     # this incrementally infers the type, see the comments on the type visitor
     # above.
@@ -353,8 +357,9 @@ class PyTorchOpConverter:
     def unsqueeze(self, inputs, input_types):
         data = inputs[0]
         axis = inputs[1]
+        axis = map_axis(int(inputs[1]), self.layout)
 
-        return _op.transform.expand_dims(data, int(axis), 1)
+        return _op.transform.expand_dims(data, axis, 1)
 
     def concatenate(self, inputs, input_types):
         def tensor_array_concat(lst, axis):
@@ -372,7 +377,10 @@ class PyTorchOpConverter:
             return get_tensor(concatenated)
 
         data = inputs[0]
-        axis = inputs[1]
+        if self.layout == "NHWC" and is_channel_concat(data):
+            axis = map_axis(int(inputs[1]), self.layout)
+        else:
+            axis = int(inputs[1])
 
         if not isinstance(data, list):
             return tensor_array_concat(data, axis)
@@ -380,7 +388,7 @@ class PyTorchOpConverter:
         if isinstance(data, _expr.Expr):
             data = [data]
 
-        return _op.tensor.concatenate(data, int(axis))
+        return _op.tensor.concatenate(data, axis)
 
     def slice(self, inputs, input_types):
         axis_dtype = "int64"
@@ -507,7 +515,7 @@ class PyTorchOpConverter:
     def split_with_sizes(self, inputs, input_types):
         data = inputs[0]
         sections = inputs[1]
-        dim = int(inputs[2])
+        dim = map_axis(int(inputs[2]), self.layout)
 
         if len(sections) == 1:
             # a special case used in torchvision detection models
@@ -524,7 +532,7 @@ class PyTorchOpConverter:
 
     def select(self, inputs, input_types):
         data = inputs[0]
-        dim = int(inputs[1])
+        dim = map_axis(int(inputs[1]), self.layout)
         index = _wrap_const(inputs[2])
         return _op.transform.take(data, index, axis=dim, mode="wrap")
 
@@ -772,7 +780,20 @@ class PyTorchOpConverter:
     def leaky_relu(self, inputs, input_types):
         data = inputs[0]
         alpha = float(inputs[1])
-        return _op.nn.leaky_relu(data, alpha)
+
+        def func(x):
+            return _op.nn.leaky_relu(x, alpha)
+
+        if self.is_quantized_tensor(data):
+            # input qparams are manually appended by us
+            assert len(inputs) == 4, "Input quant param not found in op inputs"
+            assert isinstance(inputs[-2], float)
+            assert isinstance(inputs[-1], int)
+            input_scale = _expr.const(inputs[-2])
+            input_zero_point = _expr.const(inputs[-1])
+            return qnn_torch.quantized_leaky_relu(data, input_scale, input_zero_point, func)
+
+        return func(data)
 
     def elu(self, inputs, input_types):
         data = inputs[0]
@@ -853,7 +874,7 @@ class PyTorchOpConverter:
         output_size = inputs[1]
 
         def func(x):
-            return _op.nn.adaptive_avg_pool2d(x, output_size=output_size)
+            return _op.nn.adaptive_avg_pool2d(x, output_size=output_size, layout=self.layout)
 
         if self.is_quantized_tensor(data):
             return qnn_torch.apply_with_upcast(data, func)
@@ -865,7 +886,7 @@ class PyTorchOpConverter:
         output_size = inputs[1]
 
         # returns dummy indices too
-        return _op.nn.adaptive_max_pool2d(data, output_size=output_size), None
+        return _op.nn.adaptive_max_pool2d(data, output_size=output_size, layout=self.layout), None
 
     def adaptive_max_pool_3d(self, inputs, input_types):
         data = inputs[0]
@@ -901,9 +922,10 @@ class PyTorchOpConverter:
             strides=strides,
             dilation=dilation,
             padding=padding,
-            layout="NCHW",
+            layout=self.layout,
             ceil_mode=ceil_mode,
         )
+
 
     def maxpool_2d_with_indices(self, inputs, input_types):
         # returns dummy indices too
@@ -1221,6 +1243,13 @@ class PyTorchOpConverter:
             axes[dst] = src
         else:
             axes = inputs[1]
+
+        if len(axes) == 4:
+            axes = [map_axis(axis, self.layout) for axis in axes]
+
+        if axes == [0, 1, 2, 3]:
+            return data
+
         return _op.transform.transpose(data, axes)
 
     def flatten(self, inputs, input_types):
@@ -1273,7 +1302,7 @@ class PyTorchOpConverter:
         shape = self.infer_shape_with_prelude(inputs[0])
         axis = None
         if len(inputs) > 1:
-            axis = int(inputs[1])
+            axis = map_axis(int(inputs[1]), self.layout)
 
         if any(map(lambda s: isinstance(s, tvm.tir.expr.Any), shape)):
             if axis is None or isinstance(shape[axis], tvm.tir.expr.Any):
@@ -1318,6 +1347,9 @@ class PyTorchOpConverter:
             if isinstance(shape, _expr.Expr):
                 val = _infer_value_simulated(shape, {})
                 new_shape[i] = val.numpy().item(0)
+
+        if self.layout == "NHWC" and len(new_shape) == 4:
+            new_shape = [new_shape[0], new_shape[2], new_shape[3], new_shape[1]]
 
         return _op.transform.reshape(data, new_shape)
 
@@ -1380,8 +1412,7 @@ class PyTorchOpConverter:
         return _op.transform.reshape(data, out_shape)
 
     def clone(self, inputs, input_types):
-        data = inputs[0]
-        return _op.tensor.copy(data)
+        return inputs[0]
 
     def log_softmax(self, inputs, input_types):
         data = inputs[0]
@@ -1428,6 +1459,7 @@ class PyTorchOpConverter:
                         dilation=(1, 1),
                         ceil_mode=ceil_mode,
                         count_include_pad=count_include_pad,
+                        layout=self.layout
                     )
                 elif dim == 3:
                     return _op.nn.avg_pool3d(
@@ -1561,6 +1593,8 @@ class PyTorchOpConverter:
 
         if inputs[1]:
             axis = inputs[1]
+            if self.layout == "NHWC" and len(axis) == 2:
+                axis = [1, 2]
         else:
             axis = None
 
@@ -1580,7 +1614,7 @@ class PyTorchOpConverter:
             assert len(inputs) == 6, "Input quant param not found in op inputs"
             input_scale = _expr.const(inputs[4])
             input_zero_point = _expr.const(inputs[5])
-            return qnn_torch.quantized_mean(data, input_scale, input_zero_point, func)
+            return qnn_torch.quantized_mean(data, input_scale, input_zero_point, func, layout=self.layout)
 
         return func(data)
 
@@ -1719,15 +1753,27 @@ class PyTorchOpConverter:
             pad_len = len(self.infer_shape(data)) * 2
             paddings = [0] * pad_len
 
-            if len(pad_list) >= 2:
-                paddings[-1] = pad_list[1]
-                paddings[-2] = pad_list[0]
-            if len(pad_list) >= 4:
-                paddings[-3] = pad_list[3]
-                paddings[-4] = pad_list[2]
-            if len(pad_list) >= 6:
-                paddings[-5] = pad_list[5]
-                paddings[-6] = pad_list[4]
+            assert self.layout is 'NCHW' or self.layout is 'NHWC', "Only NCHW or NHWC layout are supported"
+            if self.layout == 'NCHW':
+                if len(pad_list) >= 2:
+                    paddings[-1] = pad_list[1]
+                    paddings[-2] = pad_list[0]
+                if len(pad_list) >= 4:
+                    paddings[-3] = pad_list[3]
+                    paddings[-4] = pad_list[2]
+                if len(pad_list) >= 6:
+                    paddings[-5] = pad_list[5]
+                    paddings[-6] = pad_list[4]
+            else: # NHWC
+                if len(pad_list) >= 2:
+                    paddings[-3] = pad_list[1]
+                    paddings[-4] = pad_list[0]
+                if len(pad_list) >= 4:
+                    paddings[-5] = pad_list[3]
+                    paddings[-6] = pad_list[2]
+                if len(pad_list) >= 6:
+                    paddings[-1] = pad_list[5]
+                    paddings[-2] = pad_list[4]
 
             # group into tuple of 2 ints
             paddings = [paddings[i : i + 2] for i in range(0, len(paddings), 2)]
@@ -1806,15 +1852,16 @@ class PyTorchOpConverter:
             assert scales is not None, "neither out size nor scale provided"
             assert isinstance(scales, list)
             ishape = self.infer_shape(inputs[0])
+            dim_index = 2 if self.layout == 'NCHW' else 1
             for i, scale in enumerate(scales):
-                out_size.append(int(math.floor(float(ishape[2 + i]) * scale)))
+                out_size.append(int(math.floor(float(ishape[dim_index + i]) * scale)))
 
         return out_size
 
     def make_upsample(self, method):
         def upsample(inputs, input_types):
-            data = inputs[0]
             out_size = self.get_upsample_out_size(inputs, method)
+            data = inputs[0]
 
             if len(inputs) > 2 and method != "nearest_neighbor":
                 align_corners = inputs[2]
@@ -1830,7 +1877,7 @@ class PyTorchOpConverter:
 
             def func(x):
                 return _op.image.resize2d(
-                    x, out_size, "NCHW", method, coord_trans, cubic_alpha=-0.75
+                    x, out_size, self.layout, method, coord_trans, cubic_alpha=-0.75
                 )
 
             if self.is_quantized_tensor(data):
@@ -1839,7 +1886,7 @@ class PyTorchOpConverter:
                 assert isinstance(inputs[-1], int)
                 input_scale = _expr.const(inputs[-2])
                 input_zero_point = _expr.const(inputs[-1])
-                return qnn_torch.quantized_upsample(data, input_scale, input_zero_point, func)
+                return qnn_torch.quantized_upsample(data, input_scale, input_zero_point, func, layout=self.layout)
 
             return func(data)
 
@@ -3005,7 +3052,7 @@ class PyTorchOpConverter:
             "prim::Loop",
         ]
         known_ops += list(self.convert_map.keys())
-        known_ops += list(qnn_torch.convert_map.keys())
+        known_ops += list(qnn_torch.get_convert_map().keys())
 
         missing = [op_name for op_name in op_names if op_name not in known_ops]
 
@@ -3524,12 +3571,12 @@ def _get_relay_input_vars(graph, input_infos, prelude, is_module=True, default_d
             if not (_is_int_seq(ishape) or len(ishape) == 0):
                 msg = "Shape for Tensors must be lists of ints"
                 raise RuntimeError(msg)
-            if (pt_type.dim() is not None and pt_type.dim() != len(ishape)) or (
-                pt_type.sizes() is not None
-                and any([s1 != s2 for s1, s2 in zip(pt_type.sizes(), ishape)])
-            ):
-                msg = "Shapes of input list and information in the graph do not match"
-                raise RuntimeError(msg)
+            #if (pt_type.dim() is not None and pt_type.dim() != len(ishape)) or (
+            #    pt_type.sizes() is not None
+            #    and any([s1 != s2 for s1, s2 in zip(pt_type.sizes(), ishape)])
+            #):
+            #    msg = "Shapes of input list and information in the graph do not match"
+            #    raise RuntimeError(msg)
             pt_dtype = pt_type.scalarType()
             if not pt_dtype and itype:
                 pt_dtype = itype
@@ -3712,6 +3759,7 @@ def from_pytorch(
     input_infos,
     custom_convert_map=None,
     default_dtype="float32",
+    layout="NCHW",
     use_parser_friendly_name=False,
 ):
     """Load PyTorch model in the form of a scripted PyTorch model and convert into relay.
@@ -3758,7 +3806,7 @@ def from_pytorch(
     mod = tvm.IRModule()
     prelude = Prelude(mod)
 
-    converter = PyTorchOpConverter(prelude, default_dtype)
+    converter = PyTorchOpConverter(prelude, default_dtype, layout)
 
     graph = script_module.graph.copy()
     _run_jit_passes(graph)
@@ -3793,7 +3841,7 @@ def from_pytorch(
         qnn_torch.add_input_quant_params_to_op_inputs(graph)
         qnn_torch.add_quant_params_to_outputs(outputs, packed_param_map, weight_quant_params)
         qnn_torch.add_quant_params(tvm_params, weight_quant_params)
-        converter.update_convert_map(qnn_torch.convert_map)
+        converter.update_convert_map(qnn_torch.get_convert_map(layout))
 
     ret = converter.convert_operators(_get_operator_nodes(graph.nodes()), outputs, ret_name)[0]
     if isinstance(ret, list):
