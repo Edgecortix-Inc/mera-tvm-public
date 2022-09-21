@@ -21,3 +21,4 @@ from meratvm_internal import patterns
 from .build_module import *
 from .version import *
 from .test_util import *
+from .relay_traversal import *

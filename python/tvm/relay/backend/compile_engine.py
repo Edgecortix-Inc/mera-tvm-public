@@ -199,7 +199,7 @@ def select_implementation(op, attrs, inputs, out_type, target, use_autotvm=True)
 
     # If not use autotvm, always return the implementation with the highest priority
     if not use_autotvm:
-        logger.info(
+        logger.debug(
             "Using %s for %s based on highest priority (%d)",
             best_plevel_impl.name,
             op.name,
@@ -266,7 +266,7 @@ def select_implementation(op, attrs, inputs, out_type, target, use_autotvm=True)
                 autotvm_logger.warning(info_msg)
             autotvm_logger.debug(msg)
 
-    logger.info(
+    logger.debug(
         "Using %s for %s based on highest priority (%s)",
         best_plevel_impl.name,
         op.name,

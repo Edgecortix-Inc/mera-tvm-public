@@ -34,6 +34,9 @@
 
 namespace tvm {
 namespace relay {
+
+thread_local Function *current_merge_composite = nullptr;
+
 namespace merge_composite {
 
 Function InferType(const Function& expr, const IRModule& m) {
@@ -52,9 +55,11 @@ Expr MergeComposite(const Function& func, const Array<runtime::String>& pattern_
   for (size_t i = 0; i < patterns.size(); i++) {
     Map<String, ObjectRef> attrs;
     attrs.Set("Composite", pattern_names[i]);
+    current_merge_composite = &merged_func;
     merged_func = Downcast<Function>(PartitionPattern(patterns[i], merged_func, attrs, checks[i]));
     merged_func = InferType(merged_func, m);
   }
+  current_merge_composite = nullptr;
   return std::move(merged_func);
 }
 
@@ -81,6 +86,11 @@ TVM_REGISTER_GLOBAL("relay._transform.MergeComposite").set_body([](TVMArgs args,
     checks.push_back(args[i]);
   }
   *rv = MergeComposite(pattern_names, patterns, checks);
+});
+
+TVM_REGISTER_GLOBAL("relay._transform.CurrentMergeComposite").set_body_typed([]() -> Function {
+  ICHECK_NOTNULL(current_merge_composite);
+  return *current_merge_composite;
 });
 
 }  // namespace transform

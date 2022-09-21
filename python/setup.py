@@ -237,7 +237,7 @@ setup(
     package_dir={PKG_NAME: "tvm"},
     package_data={PKG_NAME: get_package_data_files()},
     distclass=BinaryDistribution,
-    url="https://github.com/Edgecortix-Inc/mera-tvm",
+    url="https://github.com/Edgecortix-Inc/mera-tvm-public",
     ext_modules=config_cython(),
     **setup_kwargs,
 )

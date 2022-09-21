@@ -220,6 +220,20 @@ TVM_DLL Pass PartialEval();
 TVM_DLL Pass SimplifyInference();
 
 /*!
+ * \brief Fold mul + add to previous batch norm.
+ *
+ * \return The Pass.
+ */
+TVM_DLL Pass FoldMulAddToBN();
+
+/*!
+ * \brief Remove padding layers whose pad width is 0.
+ *
+ * \return The Pass.
+ */
+TVM_DLL Pass RemoveUselessPadding();
+
+/*!
  * \brief Replaces non linear activation functions with their fast but approximate counterparts.
  *
  * \return The Pass.

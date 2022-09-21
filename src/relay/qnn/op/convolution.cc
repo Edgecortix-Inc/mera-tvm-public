@@ -40,6 +40,11 @@ namespace qnn {
 
 // relay.op.qnn.conv2d
 
+bool is_depthwise(const Conv2DAttrs* param) {
+  return param->channels.defined() && tvm::tir::ExprDeepEqual()(param->channels, param->groups) &&
+         param->groups != 1;
+}
+
 bool QnnConv2DRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
                   const TypeReporter& reporter) {
   // Expected Types: data, weight, input_zero_point, weight_zero_point, input_scale, weight_scale,
@@ -67,7 +72,7 @@ bool QnnConv2DRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
   ICHECK(IsScalarType(types[2], DataType::Int(32)));    // input_zero_point
   ICHECK(IsScalarType(types[4], DataType::Float(32)));  // input_scale
   // Kernel scale can be a vector of length output_channels or a scalar.
-  if (param->groups == 1) {
+  if (param->groups == 1 || !is_depthwise(param)) {
     size_t axis = param->kernel_layout.operator std::string().find('O');
     ICHECK(axis != std::string::npos) << "Kernel layout attribute is not defined";
     AssignType(types[5], DataType::Float(32), weight->shape[axis], reporter);  // weight_scale
@@ -77,8 +82,7 @@ bool QnnConv2DRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
     size_t i_axis = param->kernel_layout.operator std::string().find('I');
     ICHECK(o_axis != std::string::npos || i_axis != std::string::npos)
         << "Kernel layout attribute is not defined";
-    AssignType(types[5], DataType::Float(32), weight->shape[i_axis] * weight->shape[o_axis],
-               reporter);  // weight_scale
+    AssignType(types[5], DataType::Float(32), weight->shape[o_axis], reporter);  // weight_scale
   }
 
   // Collect the input tensor and output tensor devoid of scale and zero points to reuse Relay
@@ -106,11 +110,6 @@ InferCorrectLayoutOutput QnnConvInferCorrectLayout(const Attrs& attrs,
                                  channel_layout};
   Array<Layout> output_layouts = conv_new_layouts->output_layouts;
   return InferCorrectLayoutOutput(input_layouts, output_layouts, attrs);
-}
-
-bool is_depthwise(const Conv2DAttrs* param) {
-  return param->channels.defined() && tvm::tir::ExprDeepEqual()(param->channels, param->groups) &&
-         param->groups != 1;
 }
 
 // Workload - batch_size, in_channels, out_channels, kernel_h, kernel_w, channel_multiplier

@@ -17,7 +17,7 @@
 # specific language governing permissions and limitations
 # under the License.
 if(USE_MERADNA_CODEGEN STREQUAL "ON")
-  file(GLOB EC_RELAY_CONTRIB_SRC src/relay/backend/contrib/mera/mera_codegen.cc)
+  file(GLOB EC_RELAY_CONTRIB_SRC src/relay/backend/contrib/mera/*.cc)
   list(APPEND COMPILER_SRCS ${EC_RELAY_CONTRIB_SRC})
   file(GLOB EC_CONTRIB_SRC src/runtime/contrib/mera/*.cc)
   list(APPEND RUNTIME_SRCS ${EC_CONTRIB_SRC})

@@ -1753,7 +1753,7 @@ class PyTorchOpConverter:
             pad_len = len(self.infer_shape(data)) * 2
             paddings = [0] * pad_len
 
-            assert self.layout is 'NCHW' or self.layout is 'NHWC', "Only NCHW or NHWC layout are supported"
+            assert self.layout == 'NCHW' or self.layout == 'NHWC', "Only NCHW or NHWC layout are supported"
             if self.layout == 'NCHW':
                 if len(pad_list) >= 2:
                     paddings[-1] = pad_list[1]
@@ -3457,7 +3457,7 @@ def _get_pytorch_value_type(typ, default_dtype="float32"):
         if typ.scalarType() is None:
             # Tensor's type can be unknown if we use torch.jit.script(...)
             # Defaults can be passed in, if not it is float32
-            logging.warning("Untyped Tensor found, assume it is %s", default_dtype)
+            logging.debug("WARNING: Untyped Tensor found, assume it is %s", default_dtype)
             return default_dtype
         else:
             return _convert_data_type(typ.scalarType())

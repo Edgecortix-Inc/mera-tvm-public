@@ -150,7 +150,9 @@ Pass ConvertLayout(const Map<String, Array<String>>& desired_layouts) {
       [=](Function f, IRModule m, PassContext pc) {
         return Downcast<Function>(relay::convert_op_layout::ConvertLayout(f, desired_layouts));
       };
-  return CreateFunctionPass(pass_func, 3, "ConvertLayout", {"InferType", "CanonicalizeOps"});
+   // return CreateFunctionPass(pass_func, 3, "ConvertLayout", {"InferType", "CanonicalizeOps"});
+   // TODO: canonicalize by default to not break other backends
+   return CreateFunctionPass(pass_func, 3, "ConvertLayout", {"InferType"});
 }
 
 TVM_REGISTER_GLOBAL("relay._transform.ConvertLayout").set_body_typed(ConvertLayout);

@@ -32,6 +32,8 @@
 #include <string>
 #include <vector>
 
+#include "mera_compiler.h"
+
 #include "../../utils.h"
 #include "../codegen_c/codegen_c.h"
 #include "dlpack/dlpack.h"
@@ -43,21 +45,6 @@ namespace relay {
 namespace contrib {
 
 using namespace backend;
-
-struct MeraCompilerConfigNode : public tvm::AttrsNode<MeraCompilerConfigNode> {
-  String input_layout;
-  String weight_layout;
-
-  TVM_DECLARE_ATTRS(MeraCompilerConfigNode, "ext.attrs.MeraCompilerConfigNode") {
-    TVM_ATTR_FIELD(input_layout).set_default("NHWC");
-    TVM_ATTR_FIELD(weight_layout).set_default("OIHW");
-  }
-};
-
-class MeraCompilerConfig : public Attrs {
- public:
-  TVM_DEFINE_NOTNULLABLE_OBJECT_REF_METHODS(MeraCompilerConfig, Attrs, MeraCompilerConfigNode);
-};
 
 TVM_REGISTER_NODE_TYPE(MeraCompilerConfigNode);
 TVM_REGISTER_PASS_CONFIG_OPTION("relay.ext.mera.options", MeraCompilerConfig);
@@ -133,29 +120,8 @@ bool IsOp(const CallNode* call, std::string op_name) {
   return op == Op::Get(op_name);
 }
 
-mera::ir::Shape GetShape(const Type& type) {
-  const auto* ttype = type.as<TensorTypeNode>();
-  CHECK(ttype) << "Expect TensorTypeNode";
-  std::vector<int> shape;
-  int elements = 1;
-  for (size_t i = 0; i < ttype->shape.size(); ++i) {
-    auto* val = ttype->shape[i].as<IntImmNode>();
-    CHECK(val);
-    shape.push_back(val->value);
-    elements *= val->value;
-  }
-  return mera::ir::Shape{shape, int(shape.size()), elements};
-}
-
-mera::ir::DataType GetType(const Type& type) {
-  const auto* ttype = type.as<TensorTypeNode>();
-  CHECK(ttype) << "Expect TensorTypeNode";
-  return ConvertType(ttype->dtype);
-}
-
 static std::string mera_arch{};
 static std::string mera_ccfg{};
-static std::string mera_last_error{};
 
 bool IsInputNHWCLayout() {
   auto cfg = transform::PassContext::Current()->GetConfig<MeraCompilerConfig>("relay.ext.mera.options");
@@ -240,15 +206,23 @@ class Compiler {
           const auto* upsampling_call =
               GetRootCall(callee_func->body.as<CallNode>(), 1, {"image.resize2d", "qnn.quantize"});
           const auto dequantize_args = CompileArgs(dequantize_call, callee_scope);
-          const auto& input(dequantize_args[0]);
-          const auto& input_scale(dequantize_args[1]);
-          const auto& input_zero_point(dequantize_args[2]);
+          const auto& input(dequantize_args[0][0]);
+          const auto& input_scale(dequantize_args[1][0]);
+          const auto& input_zero_point(dequantize_args[2][0]);
           const auto* upsampling_attr = GetAttrChecked<Resize2DAttrs>(upsampling_call);
           const auto method = upsampling_attr->method;
+          std::string node_name;
+          if (method == "linear") {
+            node_name = "UpsamplingLinear";
+          } else if (method == "nearest_neighbor") {
+            node_name = "UpsamplingNearest";
+          } else {
+            CHECK(false) << "Unsupported upsampling method: " << method;
+          }
           const auto coord_trans = upsampling_attr->coordinate_transformation_mode;
           const auto shape = GetNCHWOutputShape(GetShape(upsampling_call->checked_type()),
                                                 upsampling_attr->layout);
-          return {graph.Add<mera::ir::Upsampling>("Upsampling", input.type, shape, input, input_scale,
+          return {graph.Add<mera::ir::Upsampling>(node_name, input.type, shape, input, input_scale,
                                                 input_zero_point, method, coord_trans)};
         } else if (name == "mera.leaky_relu") {
           const auto* dequantize_call =
@@ -259,11 +233,11 @@ class Compiler {
           const auto dequantize_args = CompileArgs(dequantize_call, callee_scope);
           const auto* quantize_call = GetRootCall(callee_func->body.as<CallNode>(), 0, {"qnn.quantize"});
           const auto quantize_args = CompileArgs(quantize_call, callee_scope);
-          const auto& input(dequantize_args[0]);
-          const auto& input_scale(dequantize_args[1]);
-          const auto& input_zero_point(dequantize_args[2]);
-          const auto& output_scale(quantize_args[1]);
-          const auto& output_zero_point(quantize_args[2]);
+          const auto& input(dequantize_args[0][0]);
+          const auto& input_scale(dequantize_args[1][0]);
+          const auto& input_zero_point(dequantize_args[2][0]);
+          const auto& output_scale(quantize_args[1][0]);
+          const auto& output_zero_point(quantize_args[2][0]);
           const auto* leaky_relu_attr = GetAttrChecked<LeakyReluAttrs>(leaky_relu_call);
           return {graph.Add<mera::ir::LeakyReLU>("LeakyReLU", input.type, input.shape, input, input_scale,
               input_zero_point, output_scale, output_zero_point, leaky_relu_attr->alpha)};
@@ -320,15 +294,124 @@ class Compiler {
             tensors_out_zp = compiler.Compile(callee_scope, quantize_call->args[2]);
           }
           const auto dequantize_args = CompileArgs(dequantize_call, callee_scope);
-          const auto& input(dequantize_args[0]);
-          const auto& input_scale(dequantize_args[1]);
-          const auto& input_zero_point(dequantize_args[2]);
+          const auto& input(dequantize_args[0][0]);
+          const auto& input_scale(dequantize_args[1][0]);
+          const auto& input_zero_point(dequantize_args[2][0]);
           const auto& output_scale(tensors_out_scale[0]);
           const auto& output_zero_point(tensors_out_zp[0]);
           const auto ret_type = input.type;
           return {graph.Add<mera::ir::HSwish>("HSwish", ret_type, input.shape, input,
                                             input_scale, input_zero_point,
                                             output_scale, output_zero_point)};
+        } else if (name == "mera.qnn_fc") {
+          const auto& call = callee_func->body.as<CallNode>();
+          const CallNode* req_call;
+          const CallNode* bias_call;
+          const CallNode* dense_call;
+          const CallNode* in_tensor;
+
+          const bool with_cast = IsOp(call, "cast");
+          if (!with_cast) {
+            req_call = GetRootCall(call, 0, {"qnn.requantize"});
+            bias_call = GetRootCall(req_call->args[0].as<CallNode>(), 0, {"nn.bias_add"});
+          } else {
+            req_call = GetRootCall(call, 2, {"qnn.requantize", "clip", "cast"});
+            bias_call = GetRootCall(req_call->args[0].as<CallNode>(), 0, {"nn.bias_add"});
+          }
+          dense_call = GetRootCall(bias_call->args[0].as<CallNode>(), 0, {"qnn.dense"});
+          const bool with_squeeze = IsOp(dense_call->args[0].as<CallNode>(), "squeeze");
+          if (with_squeeze) {
+            in_tensor = GetRootCall(dense_call->args[0].as<CallNode>(), 1, {"reshape", "squeeze"});
+          } else {
+            in_tensor = GetRootCall(dense_call->args[0].as<CallNode>(), 2, {"transpose", "reshape", "reshape"});
+          }
+
+          auto input_tensor_in = compiler.Compile(callee_scope, in_tensor->args[0]);
+          // If weights are supplied unquantized, grab the unquantized values
+          const auto* weights_call = dense_call->args[1].as<CallNode>();
+          auto weights_tensor_in = (weights_call != nullptr && IsOp(weights_call, "qnn.quantize")) ?
+            compiler.Compile(callee_scope, GetRootCall(dense_call->args[1].as<CallNode>(), 0, {"qnn.quantize"})->args[0])
+            : compiler.Compile(callee_scope, dense_call->args[1]);
+          auto dense_input_zero_point_in = compiler.Compile(callee_scope, dense_call->args[2]);
+          auto dense_weight_zero_point_in = compiler.Compile(callee_scope, dense_call->args[3]);
+          auto dense_input_scale_in = compiler.Compile(callee_scope, req_call->args[1]);
+          auto dense_weight_scale_in = compiler.Compile(callee_scope, dense_call->args[5]);
+          auto bias_tensor_in = compiler.Compile(callee_scope, bias_call->args[1]);
+          auto output_scale_in = compiler.Compile(callee_scope, req_call->args[3]);
+          auto output_zero_point_in = compiler.Compile(callee_scope, req_call->args[4]);
+
+          CHECK_EQ(weights_tensor_in.size(), 1);
+          CHECK_EQ(input_tensor_in.size(), 1);
+          CHECK_EQ(dense_input_zero_point_in.size(), 1);
+          CHECK_EQ(dense_weight_zero_point_in.size(), 1);
+          CHECK_EQ(dense_input_scale_in.size(), 1);
+          CHECK_EQ(dense_weight_scale_in.size(), 1);
+          CHECK_EQ(bias_tensor_in.size(), 1);
+          CHECK_EQ(output_scale_in.size(), 1);
+          CHECK_EQ(output_zero_point_in.size(), 1);
+
+          const auto& bias(bias_tensor_in[0]);
+          const auto& weights(weights_tensor_in[0]);
+          const auto& input(input_tensor_in[0]);
+          const auto& dense_input_scale(dense_input_scale_in[0]);
+          const auto& dense_input_zero_point(dense_input_zero_point_in[0]);
+          const auto& dense_weight_scale(dense_weight_scale_in[0]);
+          const auto& dense_weight_zero_point(dense_weight_zero_point_in[0]);
+          const auto& output_scale(output_scale_in[0]);
+          const auto& output_zero_point(output_zero_point_in[0]);
+
+          const auto out_shape1d = GetShape(call->checked_type());
+          const mera::ir::Shape out_shape{
+            {out_shape1d.shape[0], out_shape1d.shape[1], 1, 1}, 4, out_shape1d.shape[0] * out_shape1d.shape[1]};
+          return {graph.Add<mera::ir::Fc>("Fc", input.type, out_shape, input,
+                                          weights, dense_input_scale, dense_input_zero_point, dense_weight_scale,
+                                          dense_weight_zero_point, bias, output_scale, output_zero_point)};
+        } else if (name == "mera.avg_pooling2d") {
+          const auto& call = callee_func->body.as<CallNode>();
+          const CallNode *in_call;
+          const bool with_adaptive = IsOp(GetRootCall(call, 0, {"cast"})->args[0].as<CallNode>(), "nn.adaptive_avg_pool2d");
+          if (with_adaptive) {
+            in_call = GetRootCall(call, 2, {"cast", "nn.adaptive_avg_pool2d", "cast"});
+          } else {
+            in_call = GetRootCall(call, 4, {"nn.pad", "nn.pad", "cast", "nn.avg_pool2d", "cast"});
+          }
+
+          auto input_tensor_in = compiler.Compile(callee_scope, in_call->args[0]);
+          CHECK_EQ(input_tensor_in.size(), 1);
+          const auto& input(input_tensor_in[0]);
+          const mera::ir::Shape out_shape{
+            {input.shape.shape[0], input.shape.shape[1], 1, 1}, 4, input.shape.shape[0] * input.shape.shape[1]
+          };
+          return {graph.Add<mera::ir::AvgPooling2d>("AvgPooling2d", input.type, out_shape, input)};
+        } else if (name == "mera.mean") {
+          const auto& call = callee_func->body.as<CallNode>();
+
+          const auto* requantize = GetRootCall(call, 0, {"qnn.requantize"});
+          const auto* in_call = GetRootCall(call, 2, {"cast", "mean", "qnn.requantize"});
+
+          auto tensor_in_scale = compiler.Compile(callee_scope, requantize->args[1]);
+          auto tensor_in_zp = compiler.Compile(callee_scope, requantize->args[2]);
+          auto tensor_out_scale = compiler.Compile(callee_scope, requantize->args[3]);
+          auto tensor_out_zp = compiler.Compile(callee_scope, requantize->args[4]);
+          auto input_tensor_in = compiler.Compile(callee_scope, in_call->args[0]);
+
+          CHECK_EQ(tensor_in_scale.size(), 1);
+          CHECK_EQ(tensor_in_zp.size(), 1);
+          CHECK_EQ(tensor_out_scale.size(), 1);
+          CHECK_EQ(tensor_out_zp.size(), 1);
+          CHECK_EQ(input_tensor_in.size(), 1);
+
+          const auto& tensor_in_scale_v(tensor_in_scale[0]);
+          const auto& tensor_in_zp_v(tensor_in_zp[0]);
+          const auto& tensor_out_scale_v(tensor_out_scale[0]);
+          const auto& tensor_out_zp_v(tensor_out_zp[0]);
+          const auto& input(input_tensor_in[0]);
+
+          const mera::ir::Shape out_shape{
+            {input.shape.shape[0], input.shape.shape[1], 1, 1}, 4, input.shape.shape[0] * input.shape.shape[1]
+          };
+          return {graph.Add<mera::ir::Mean>("Mean", input.type,
+            out_shape, input, tensor_in_scale_v, tensor_in_zp_v, tensor_out_scale_v, tensor_out_zp_v)};
         }
         return {compiler.Compile(callee_scope, callee_func->body)};
       }
@@ -347,7 +430,20 @@ class Compiler {
           return CompileComposite(callee_func, composite_name.value(), callee_scope);
         }
 
-        const auto inputs = CompileArgs(call);
+        auto flatten_inputs = [](const auto& inputs) {
+          std::vector<mera::ir::Tensor> flist;
+          for (const auto& input_tuple : inputs) {
+            CHECK_EQ(input_tuple.size(), 1);
+            flist.push_back(input_tuple[0]);
+          }
+          return std::move(flist);
+        };
+        auto input_tuples = CompileArgs(call);
+        std::vector<mera::ir::Tensor> flat_inputs;
+        if (!IsOp(call, "qnn.concatenate")) {
+          flat_inputs = flatten_inputs(input_tuples);
+        }
+        const auto& inputs(flat_inputs);
         const auto shape = GetShape(call->checked_type());
 
         if (IsOp(call, "layout_transform")) {
@@ -421,7 +517,7 @@ class Compiler {
           const auto* conv2d_attr = GetAttrChecked<Conv2DAttrs>(call);
           const auto attr_values = GetConv2DAttrValues(conv2d_attr);
           auto wt(inputs[1]);
-          if (attr_values.groups == 1 && attr_values.output_channels == 1) {
+          if (attr_values.groups == 1 && attr_values.output_channels == 1 && wt.shape.shape[0] != attr_values.output_channels) {
             compiler.ResolveDwPwConvWeightLayout(inputs[1].id);
             std::swap(wt.shape.shape[0], wt.shape.shape[1]);
           }
@@ -503,6 +599,52 @@ class Compiler {
         } else if (IsOp(call, "nn.leaky_relu")) {
           // this helps mera.leaky_relu to retrieve the output_scale and output_zero_point values.
           return inputs;
+        } else if (IsOp(call, "image.resize2d")) {
+          const auto* attr = GetAttrChecked<Resize2DAttrs>(call);
+          const auto input = inputs[0];
+          const auto input_scale = graph.AddFloatVec(std::vector<float>(1, 1.0));
+          const auto input_zero_point = graph.AddInt32Vec(std::vector<int32_t>(1, 0));
+          const auto method = attr->method;
+          std::string node_name;
+          if (method == "nearest_neighbor") {
+              node_name = "UpsamplingNearest";
+          } else {
+            CHECK(false) << "Unsupported upsampling method: " << method;
+          }
+          const auto coord_trans = attr->coordinate_transformation_mode;
+          const auto out_shape = GetNCHWOutputShape(shape, attr->layout);
+          return {graph.Add<mera::ir::Upsampling>(node_name, input.type, out_shape, input,
+            input_scale, input_zero_point, method, coord_trans)};
+        } else if (IsOp(call, "qnn.concatenate")) {
+          const auto& data(input_tuples[0]);
+          const auto& input_scales(input_tuples[1]);
+          const auto& input_zps(input_tuples[2]);
+          const auto& output_scale(input_tuples[3][0]);
+          const auto& output_zero_point(input_tuples[4][0]);
+          const auto* attr = GetAttrChecked<ConcatenateAttrs>(call);
+          int axis = attr->axis;
+          const auto& dtype = data[0].type;
+          int nchw_depth_sum = 0;
+          CHECK(data.size() >= 1);
+          for (const auto& it : data) {
+            nchw_depth_sum += it.shape.shape.at(1);
+          }
+
+          // Apply requantizations of the input tensors to output domain
+          CHECK_EQ(data.size(), input_scales.size());
+          CHECK_EQ(data.size(), input_zps.size());
+          std::vector<mera::ir::Tensor> in_tensors;
+          for (size_t i = 0; i < data.size(); ++i) {
+            const auto req = graph.Add<mera::ir::Requantize>("Requantize", data[i].type, data[i].shape,
+              data[i], input_scales[i], input_zps[i], output_scale, output_zero_point);
+            in_tensors.emplace_back(req);
+          }
+
+          // Inherit the shape from the input with the channels of the output
+          const mera::ir::Shape out_shape{
+            {data[0].shape.shape[0], nchw_depth_sum, data[0].shape.shape[2], data[0].shape.shape[3]}, 4,
+            data[0].shape.shape[0] * nchw_depth_sum * data[0].shape.shape[2] * data[0].shape.shape[3]};
+          return {graph.Add<mera::ir::Concatenate>("Concatenate", dtype, out_shape, in_tensors, axis)};
         } else {
           LOG(FATAL) << "Compiler Unsupported operator: " << AsText(call->op, false);
         }
@@ -557,23 +699,23 @@ class Compiler {
         const int elements = std::accumulate(int_shape.begin(), int_shape.end(), 1,
                                              [](auto acc, auto val) { return acc * val; });
 
-        const auto ec_shape = mera::ir::Shape{convert_shape(int_shape), int(shape.size()), elements};
+        const auto mera_shape = mera::ir::Shape{convert_shape(int_shape), int(shape.size()), elements};
 
         if (constant->data->dtype.code == kDLFloat && constant->data->dtype.bits == 32) {
           const auto* ptr = static_cast<float*>(constant->data->data);
           const std::vector<float> values(ptr, ptr + elements);
           return {graph.Add<mera::ir::FloatVecConstant>("FloatConstant", mera::ir::DataType::Float32,
-                                                      ec_shape, convert_layout(values))};
+                                                      mera_shape, convert_layout(values))};
         } else if (constant->data->dtype.code == kDLInt && constant->data->dtype.bits == 32) {
           const auto* ptr = static_cast<int*>(constant->data->data);
           const std::vector<int> values(ptr, ptr + elements);
           return {graph.Add<mera::ir::Int32VecConstant>("IntConstant", mera::ir::DataType::Int32,
-                                                      ec_shape, convert_layout(values))};
+                                                      mera_shape, convert_layout(values))};
         } else if (constant->data->dtype.code == kDLInt && constant->data->dtype.bits == 8) {
           const auto* ptr = static_cast<int8_t*>(constant->data->data);
           const std::vector<int8_t> values(ptr, ptr + elements);
           return {graph.Add<mera::ir::Int8VecConstant>("IntConstant", mera::ir::DataType::Int8,
-                                                     ec_shape, convert_layout(values))};
+                                                     mera_shape, convert_layout(values))};
         } else {
           LOG(FATAL) << "Unsupported constant type";
         }
@@ -590,17 +732,16 @@ class Compiler {
         return results;
       }
 
-      std::vector<mera::ir::Tensor> CompileArgs(const CallNode* call, const Scope& scope) {
-        std::vector<mera::ir::Tensor> arg_tensors;
+      std::vector<std::vector<mera::ir::Tensor>> CompileArgs(const CallNode* call, const Scope& scope) {
+        std::vector<std::vector<mera::ir::Tensor>> arg_tensors;
         for (auto& arg : call->args) {
           auto tensors = compiler.Compile(scope, arg);
-          CHECK_EQ(tensors.size(), 1);
-          arg_tensors.emplace_back(tensors[0]);
+          arg_tensors.emplace_back(tensors);
         }
         return arg_tensors;
       }
 
-      std::vector<mera::ir::Tensor> CompileArgs(const CallNode* call) {
+      std::vector<std::vector<mera::ir::Tensor>> CompileArgs(const CallNode* call) {
         return CompileArgs(call, current_scope);
       }
 
@@ -664,13 +805,7 @@ class MeraModuleCodeGen {
     }
 
     // call the Mera Compiler
-    mera_last_error = "";
-    std::vector<uint8_t> code;
-    try {
-      code = mera::compile::Compile(module_, mera_arch, mera_ccfg);
-    } catch (const std::exception& ex) {
-      mera_last_error = ex.what();
-    }
+    std::vector<uint8_t> code = mera::compile::Compile(module_, mera_arch, mera_ccfg);
 
     DLTensor input;
     input.data = code.data();
@@ -696,20 +831,51 @@ class MeraModuleCodeGen {
   mera::ir::Module module_;
 };
 
+runtime::Module CompileModuleFp32(const ObjectRef &ref) {
+  CHECK(ref->IsInstance<FunctionNode>());
+  auto func = Downcast<Function>(ref);
+  auto func_name = GetExtSymbol(func);
+  auto mod = IRModule::FromExpr(func);
+  auto cdgen_cfg = GetMeraCompilerConfig();
+
+  CHECK_EQ(mod->functions.size(), 1);
+  const auto f_compile = Downcast<Function>((*mod->functions.begin()).second);
+  CHECK(func.defined()) << "Expected a Relay function";
+
+  mera::ir::Module mera_mod;
+  MeraFp32Compiler codegen(GetExtSymbol(f_compile), mera_mod);
+  codegen.Compile(f_compile);
+
+  // Call MERA compiler
+  std::vector<uint8_t> code = mera::compile::Compile(mera_mod, cdgen_cfg->mera_arch, cdgen_cfg->mera_ccfg);
+
+  DLTensor input;
+  input.data = code.data();
+  input.device = DLDevice{kDLCPU, 0};
+  input.ndim = 1;
+  input.dtype = DLDataType{kDLUInt, 8, 1};
+  int64_t shape[] = {int64_t(code.size())};
+  input.shape = shape;
+  input.strides = nullptr;
+  input.byte_offset = 0;
+  bool interpreter = cdgen_cfg->mera_arch.empty();
+  const auto* pf = runtime::Registry::Get("runtime.module.mera_module_create_empty");
+  return (*pf)(&input, interpreter, func_name);
+}
+
 runtime::Module MeraCompiler(const ObjectRef& ref) {
   MeraModuleCodeGen c;
   return c.CompileModule(ref);
 }
 TVM_REGISTER_GLOBAL("relay.ext.mera").set_body_typed(MeraCompiler);
 
+TVM_REGISTER_GLOBAL("relay.ext.mera_fp32").set_body_typed(CompileModuleFp32);
+
 void SetMeraArch(const std::string& arch) { mera_arch = arch; }
 TVM_REGISTER_GLOBAL("relay.ext.mera.set_arch").set_body_typed(SetMeraArch);
 
 void SetMeraCConfig(const std::string& ccfg) { mera_ccfg = ccfg; }
 TVM_REGISTER_GLOBAL("relay.ext.mera.set_ccfg").set_body_typed(SetMeraCConfig);
-
-std::string GetMeraError() { return mera_last_error; }
-TVM_REGISTER_GLOBAL("relay.ext.mera.get_error").set_body_typed(GetMeraError);
 
 }  // namespace contrib
 }  // namespace relay

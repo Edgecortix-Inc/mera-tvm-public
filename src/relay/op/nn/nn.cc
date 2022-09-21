@@ -49,6 +49,41 @@ namespace relay {
 // relay.nn.bias_add
 TVM_REGISTER_NODE_TYPE(BiasAddAttrs);
 
+InferCorrectLayoutOutput BiasAddInferCorrectLayout(const Attrs& attrs,
+                                                   const Array<Layout>& new_in_layouts,
+                                                   const Array<Layout>& old_in_layouts,
+                                                   const Array<tvm::relay::Type>& old_in_types) {
+  const auto* attrs_ptr = attrs.as<BiasAddAttrs>();
+  ICHECK(attrs_ptr);
+  ObjectPtr<BiasAddAttrs> param = make_object<BiasAddAttrs>(*attrs_ptr);
+
+  Array<Array<IndexExpr>> old_in_shapes;
+  for (auto old_in_t : old_in_types) {
+    ICHECK(old_in_t.as<TensorTypeNode>());
+    old_in_shapes.push_back(old_in_t.as<TensorTypeNode>()->shape);
+  }
+
+  size_t axis =
+      param->axis < 0 ? param->axis + old_in_shapes[0].size() : static_cast<size_t>(param->axis);
+
+  Layout ret = Layout::Undef();
+
+  // If new_in_layouts are defined, this code tries to modify the layout.
+  if (new_in_layouts.defined() && old_in_layouts.defined()) {
+    // Get the new C axis. Extract the dim in old layout. Find the index of that dim in next layout.
+    const auto& bn_dim = old_in_layouts[0][axis];
+    auto new_index = new_in_layouts[0].IndexOf(bn_dim);
+    param->axis = new_index;
+    ret = new_in_layouts[0];
+  } else if (old_in_layouts.defined()) {
+    ret = old_in_layouts[0];
+  }
+  // The bias has "C" layout.
+  Layout c_layout = Layout("C");
+  return InferCorrectLayoutOutput({ret, c_layout},
+                                  {ret}, Attrs(param));
+}
+
 bool BiasAddRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
                 const TypeReporter& reporter) {
   ICHECK_EQ(types.size(), 3);
@@ -95,6 +130,7 @@ RELAY_REGISTER_OP("nn.bias_add")
     .add_argument("bias", "1D Tensor", "Bias.")
     .set_support_level(1)
     .add_type_rel("BiasAdd", BiasAddRel)
+    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", BiasAddInferCorrectLayout)
     .set_attr<FTVMCompute>("FTVMCompute", [](const Attrs& attrs, const Array<te::Tensor>& inputs,
                                              const Type& out_type) {
       const auto* param = attrs.as<BiasAddAttrs>();

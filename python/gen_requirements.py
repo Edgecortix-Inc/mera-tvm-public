@@ -52,6 +52,7 @@ import re
 import textwrap
 import sys
 import typing
+import logging
 
 
 RequirementsByPieceType = typing.List[typing.Tuple[str, typing.Tuple[str, typing.List[str]]]]
@@ -203,6 +204,13 @@ REQUIREMENTS_BY_PIECE: RequirementsByPieceType = [
 
 ConstraintsType = typing.List[typing.Tuple[str, typing.Union[None, str]]]
 
+try:
+    from meratvm_internal import get_version as __mtvm_internal_v
+    MTVM_CURR_VERSION = "<=" + __mtvm_internal_v.get_version()
+except:
+    logging.warning(f'Could not find the current mera-tvm-internal version. Installation will not constrain it to any version.')
+    MTVM_CURR_VERSION = None
+
 # Maps a named Python package (which should appear in REQUIREMENTS_BY_PIECE above) to a
 # semver or pip version constraint. Semver constraints are translated into requirements.txt-friendly
 # constraints.
@@ -234,6 +242,7 @@ CONSTRAINTS = [
     ("h5py", "==2.10.0"),
     ("image", None),
     ("matplotlib", None),
+    ("mera-tvm-internal", MTVM_CURR_VERSION),
     ("numpy", None),
     ("onnx", None),
     ("onnxruntime", None),

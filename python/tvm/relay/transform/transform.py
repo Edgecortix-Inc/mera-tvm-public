@@ -187,6 +187,26 @@ def SimplifyInference():
     return _ffi_api.SimplifyInference()
 
 
+def FoldMulAddToBN():
+    """Fold mul + add to previous batch norm.
+    Returns
+    -------
+    ret: tvm.transform.Pass
+        The registered pass to perform batchnorm-mul-add folding.
+    """
+    return _ffi_api.FoldMulAddToBN()
+
+
+def RemoveUselessPadding():
+    """Remove padding layers whose pad width is 0.
+    Returns
+    -------
+    ret: tvm.transform.Pass
+        The registered pass to remove useless padding layers.
+    """
+    return _ffi_api.RemoveUselessPadding()
+
+
 def FastMath():
     """Converts the expensive non linear functions to their fast but approximate counterparts.
 
@@ -534,6 +554,8 @@ def MergeComposite(pattern_table):
 
     return _ffi_api.MergeComposite(pattern_names, patterns, *checks)
 
+def GetCurrentMergeComposite():
+    return _ffi_api.CurrentMergeComposite()
 
 def MergeCompilerRegions():
     """Merge together compiler regions.
