@@ -68,9 +68,13 @@ def convert_to_object(value, span=None):
     if isinstance(value, dict):
         vlist = []
         for item in value.items():
-            if not isinstance(item[0], ObjectTypes) and not isinstance(item[0], string_types):
+            if (
+                not isinstance(item[0], ObjectTypes)
+                and not isinstance(item[0], string_types)
+                and not isinstance(item[0], Number)
+            ):
                 raise ValueError("key of map must already been a container type")
-            vlist.append(item[0])
+            vlist.append(convert_to_object(item[0]))
             vlist.append(convert_to_object(item[1]))
         return _ffi_api.Map(*vlist)
     if isinstance(value, ObjectGeneric):
@@ -111,11 +115,17 @@ def _scalar_type_inference(value):
     elif isinstance(value, bool):
         dtype = "bool"
     elif isinstance(value, float):
-        # We intentionally convert the float to float32 since it's more common in DL.
-        dtype = "float32"
+        # We intentionally prefer convert the float to float32 since it's more common in DL.
+        if -3.40282347e38 <= value <= 3.40282347e38:
+            dtype = "float32"
+        else:
+            dtype = "float64"
     elif isinstance(value, int):
-        # We intentionally convert the python int to int32 since it's more common in DL.
-        dtype = "int32"
+        # We intentionally prefer convert the python int to int32 since it's more common in DL.
+        if -2147483648 <= value <= 2147483647:
+            dtype = "int32"
+        else:
+            dtype = "int64"
     else:
         raise NotImplementedError(
             "Cannot automatically inference the type." " value={}".format(value)

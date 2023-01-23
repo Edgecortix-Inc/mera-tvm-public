@@ -22,6 +22,7 @@ import os
 import shutil
 import sys
 import sysconfig
+import pathlib
 import platform
 import glob
 import pathlib
@@ -54,13 +55,36 @@ def get_lib_path():
     if not CONDA_BUILD:
         lib_path = libinfo["find_lib_path"]()
         libs = [lib_path[0]]
-        if libs[0].find("runtime") == -1:
+        if "runtime" not in libs[0]:
             for name in lib_path[1:]:
-                if name.find("runtime") != -1:
+                if "runtime" in name:
                     libs.append(name)
                     break
+
+        # Add standalone_crt, if present
+        for name in lib_path:
+            candidate_path = os.path.join(os.path.dirname(name), "standalone_crt")
+            if os.path.isdir(candidate_path):
+                libs.append(candidate_path)
+                break
+
+        # Add microTVM template projects
+        for name in lib_path:
+            candidate_path = os.path.join(os.path.dirname(name), "microtvm_template_projects")
+            if os.path.isdir(candidate_path):
+                libs.append(candidate_path)
+                break
+
+        # Add tvmc configuration json files
+        for name in lib_path:
+            candidate_path = os.path.abspath(os.path.join(os.path.dirname(name), "..", "configs"))
+            if os.path.isdir(candidate_path):
+                libs.append(candidate_path)
+                break
+
     else:
         libs = None
+
     return libs, version
 
 
@@ -99,11 +123,14 @@ def config_cython():
             subdir = "_cy2"
         ret = []
         path = "tvm/_ffi/_cython"
-        extra_compile_args = ["-std=c++14", "-DDMLC_USE_LOGGING_LIBRARY=<tvm/runtime/logging.h>"]
+        extra_compile_args = ["-std=c++17", "-DDMLC_USE_LOGGING_LIBRARY=<tvm/runtime/logging.h>"]
         if os.name == "nt":
             library_dirs = ["tvm", "../build/Release", "../build"]
             libraries = ["tvm"]
-            extra_compile_args = None
+            extra_compile_args = [
+                "/std:c++17",
+                "/D DMLC_USE_LOGGING_LIBRARY=<tvm/runtime/logging.h>",
+            ]
             # library is available via conda env.
             if CONDA_BUILD:
                 library_dirs = [os.environ["LIBRARY_LIB"]]
@@ -144,14 +171,6 @@ class BinaryDistribution(Distribution):
     def is_pure(self):
         return False
 
-
-include_libs = False
-wheel_include_libs = False
-if not CONDA_BUILD:
-    if "bdist_wheel" in sys.argv:
-        wheel_include_libs = True
-    else:
-        include_libs = True
 
 setup_kwargs = {}
 
@@ -198,11 +217,12 @@ if wheel_include_libs:
             fo.write(f"include tvm/{pkg_data}\n")
     setup_kwargs = {"include_package_data": True}
 
-if include_libs:
-    curr_path = os.path.dirname(os.path.abspath(os.path.expanduser(__file__)))
-    for i, path in enumerate(LIB_LIST):
-        LIB_LIST[i] = os.path.relpath(path, curr_path)
-    setup_kwargs = {"include_package_data": True, "data_files": [("tvm", LIB_LIST)]}
+            if os.path.isdir(path):
+                _, libname = os.path.split(path)
+                shutil.copytree(path, os.path.join(CURRENT_DIR, "tvm", libname))
+                fo.write(f"recursive-include tvm/{libname} *\n")
+
+    setup_kwargs = {"include_package_data": True}
 
 
 # Temporarily add this directory to the path so we can import the requirements generator
@@ -243,7 +263,7 @@ setup(
 )
 
 
-if wheel_include_libs:
+if not CONDA_BUILD:
     # Wheel cleanup
     os.remove("MANIFEST.in")
     for path in LIB_LIST:

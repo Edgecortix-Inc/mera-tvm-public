@@ -28,10 +28,24 @@ from .. import expr as _expr
 from .. import function as _function
 from .. import transform as _transform
 from .. import op as _op
+from .. import ty as _ty
 from .. import analysis
 
+
+class DuplicateFilter:
+    """A log filter that only prints the same message once."""
+
+    def __init__(self):
+        self.msgs = set()
+
+    def filter(self, record):
+        self.msgs.add(record.msg)
+        return record.msg not in self.msgs
+
+
 # pylint: disable=invalid-name
-logger = logging.getLogger("Common")
+logger = logging.getLogger("Frontend")
+logger.addFilter(DuplicateFilter())
 # Uncomment below line to print all debug msgs
 # logger.setLevel(logging.DEBUG)
 
@@ -577,14 +591,15 @@ def infer_value_simulated(input_val, params):
     return output_value
 
 
-def try_infer_value(val, on_success=None, on_failure=None):
+def try_infer_value(val, on_success=None, on_failure=None, parameters=None):
     """Try running infer_value on the input val, and if successful, return the inferred value or
     pass it to on_success callback if provided. Otherwise, run on_failure callback if it is
     provided, or return the input val as output. In each case, the second return value
     indicates whether infer_value has succeeded or not.
     """
     try:
-        ret = infer_value(val, {}).numpy()
+        params = parameters if parameters is not None else {}
+        ret = infer_value(val, params).numpy()
         if on_success:
             return on_success(ret), True
         return ret, True
@@ -592,6 +607,19 @@ def try_infer_value(val, on_success=None, on_failure=None):
         if on_failure:
             return on_failure(), False
         return val, False
+
+
+def shape_of(x, dtype="int64", start=None, end=None):
+    """Get shape of a tensor."""
+
+    ttype = infer_type(x).checked_type
+    if not _ty.is_dynamic(ttype):
+        shape = list(ttype.shape)
+        start = start or 0  # default to first
+        end = end or len(shape)  # default to last
+        shape_sliced = shape[start:end]
+        return _expr.const(shape_sliced, dtype)
+    return _op.shape_of(x, dtype)
 
 
 def new_var(name_hint, type_annotation=None, shape=None, dtype="float32"):
@@ -658,6 +686,46 @@ def unbind(data, axis=0):
     return _expr.TupleWrapper(_expr.Tuple(ret), selections)
 
 
+def rnn_cell(
+    input_seqs, hidden_state, w_inp, w_hid, b_inp=None, b_hid=None, backwards=False, act=_op.tanh
+):
+    """
+    Common implementation of RNN cell for all frontends of TVM
+
+    Parameters
+    ----------
+    input_seqs : List[relay.Expr]
+        The sequence of input tensors
+        Input tensor should be 2d while issue #8412 is not resolved
+        Shape = (batch, feature_size)
+    hidden_state : relay.Expr
+        Hidden state. shape = (batch_size, hidden_size)
+    w_inp, w_hid: relay.Expr
+        weight matrices. shape = (hidden_size, feature_size), (hidden_size, feature_size)
+    b_inp, b_hid : relay.Expr
+        bias matrices. The same order of internal parts as for weights. shape = (1 * hidden_size)
+    backwards : bool
+        Flag for reverse pass of RNN
+    act : relay.op
+        activation function. It is tanh by default.
+
+    Returns
+    -------
+    result : List[relay.Expr], relay.Expr, relay.Expr
+        The sequence of computed result, final hidden and cell state
+    """
+    outputs_list = []
+    for x_t in input_seqs if not backwards else reversed(input_seqs):
+        xwt = _op.nn.dense(x_t, w_inp)
+        hwt = _op.nn.dense(hidden_state, w_hid)
+        if b_inp is not None and b_hid is not None:
+            xwt += b_inp
+            hwt += b_hid
+        hidden_state = act(xwt + hwt)
+        outputs_list.append(hidden_state)  # [seq_num, (batch, hidden_size)]
+    return outputs_list, hidden_state
+
+
 def gru_cell(
     input_seqs,
     hidden_state,
@@ -690,11 +758,11 @@ def gru_cell(
     b_inp, b_hid : relay.Expr
         bias matrices. The same order of internal parts as for weights. shape = (3 * hidden_size)
     r_act : relay.op
-        activation funtion for reset gate. it is sigmoid by default
+        activation function for reset gate. it is sigmoid by default
     z_act : relay.op
-        activation funtion for update gate. it is sigmoid by default
+        activation function for update gate. it is sigmoid by default
     n_act : relay.op
-        activation funtion for new gate. it is tanh by default
+        activation function for new gate. it is tanh by default
     backwards : bool
         Flag for reverse pass of GRU
 
@@ -786,7 +854,7 @@ def lstm_cell(
     p_i, p_f, p_o : relay.Expr
         peephole LSTM matrices. shape = (batch, hidden_size)
     f_act, g_act, h_act : relay.op
-        activation funtions
+        activation functions
     backwards : bool
         Flag for reverse pass of LSTM
 
@@ -835,3 +903,97 @@ def lstm_cell(
         outputs_list.append(hidden_state)  # [seq_num, (batch, hidden_size)]
 
     return outputs_list, hidden_state, cell_state
+
+
+def autopad(
+    data,
+    strides,
+    kernel_shape,
+    dilations=(1, 1),
+    pad_type="constant",
+    deconv=False,
+    mode="SAME_UPPER",
+    pad_value=0.0,
+):
+    """
+    Perform autopadding with dynamic input shapes
+    """
+    # get attributes as constants
+    strides = _op.const(np.array(strides), dtype="int64")
+    dilated_kernel_shape = _op.const(
+        np.array(
+            [(kernel - 1) * dilation + 1 for kernel, dilation in zip(kernel_shape, dilations)]
+        ),
+        dtype="int64",
+    )
+    # get input shape
+    ndim = len(infer_shape(data))
+    shape = _op.strided_slice(shape_of(data, dtype="int64"), [2], [ndim])
+
+    # set up integer constants
+    zero = _op.const(0, dtype="int64")
+    one = _op.const(1, dtype="int64")
+    two = _op.const(2, dtype="int64")
+
+    # Calculate total padding
+    mod = _op.mod(shape, strides)
+
+    left = _op.maximum(dilated_kernel_shape - strides, zero)
+    right = _op.maximum(dilated_kernel_shape - mod, zero)
+
+    total_pad = _op.where(_op.equal(mod, zero), left, right)
+    if deconv:
+        total_pad = _op.const(np.array(kernel_shape), dtype="int64") - one - total_pad
+
+    # split total padding into before and after
+    pad_before = _op.floor_divide(total_pad, two)
+    pad_after = total_pad - pad_before
+
+    # combine
+    if "LOWER" in mode:
+        pad = _op.concatenate(
+            [_op.reshape(pad_after, [-1, 1]), _op.reshape(pad_before, [-1, 1])], axis=1
+        )
+    else:
+        pad = _op.concatenate(
+            [_op.reshape(pad_before, [-1, 1]), _op.reshape(pad_after, [-1, 1])], axis=1
+        )
+
+    # pad N and C with zeros
+    pad = _op.concatenate([_op.const(np.zeros([2, 2], dtype="int64"), dtype="int64"), pad], axis=0)
+
+    if isinstance(pad_value, (float, int)):
+        pad_value = _op.const(pad_value)
+
+    return _op.nn.pad(data, fold_constant(pad), pad_value, pad_type)
+
+
+def ensure_scalar_shape(x):
+    """
+    Assume that `x` is a tensor with one element (regardless of tensor rank).
+    Return a version of that tensor with rank 0.
+    """
+    x_shape = infer_shape(x)
+    x_rank = len(x_shape)
+
+    if x_rank == 0:
+        return x
+
+    num_elem = np.prod(x_shape)
+    assert num_elem == 1, "Cannot squeeze tensor shape {} to scalar form.".format(x_shape)
+
+    return _op.squeeze(x)
+
+
+def try_resolve_var_to_const(x, graph_params):
+    """
+    Try to resolve the value of tensor `x` to a specific value.
+    If successful, return a Const op with that value.
+    If unsuccessful, simply return `x`.
+    """
+    if isinstance(x, _expr.Var) and x.name_hint in graph_params:
+        value = graph_params[x.name_hint].numpy()
+        dtype = infer_type(x).checked_type.dtype
+        return _op.const(value, dtype)
+
+    return x

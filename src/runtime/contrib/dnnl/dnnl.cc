@@ -44,6 +44,32 @@ typedef struct {
   void** data;
 } DnnlPackedArgs;
 
+inline dnnl::memory::desc GenDNNLMemDescByShape(const dnnl::memory::dims& shape,
+                                                memory::data_type dtype) {
+  using tag = memory::format_tag;
+
+  dnnl::memory::desc data_md;
+
+  switch (shape.size()) {
+    case 2:
+      data_md = dnnl::memory::desc({shape, dtype, tag::ab});
+      break;
+    case 3:
+      data_md = dnnl::memory::desc({shape, dtype, tag::abc});
+      break;
+    case 4:
+      data_md = dnnl::memory::desc({shape, dtype, tag::abcd});
+      break;
+    case 5:
+      data_md = dnnl::memory::desc({shape, dtype, tag::abcde});
+      break;
+    default:
+      LOG(FATAL) << "Unsupported data shape dimension: " << shape.size();
+      break;
+  }
+  return data_md;
+}
+
 // Read from memory, write to handle
 inline void read_from_dnnl_memory(void* handle, const memory& mem) {
   size_t bytes = mem.get_desc().get_size();
@@ -53,8 +79,9 @@ inline void read_from_dnnl_memory(void* handle, const memory& mem) {
 }
 
 void dnnl_conv2d_common(float* data, float* weights, float* bias, float* out, int p_N_, int p_C_,
-                        int p_H_, int p_W_, int p_O_, int p_G_, int p_Ph_, int p_Pw_, int p_Kh_,
-                        int p_Kw_, int p_Sh_, int p_Sw_, primitive_attr attr) {
+                        int p_H_, int p_W_, int p_O_, int p_G_, int p_Ph0_, int p_Pw0_, int p_Ph1_,
+                        int p_Pw1_, int p_Kh_, int p_Kw_, int p_Sh_, int p_Sw_, primitive_attr attr,
+                        bool channel_last, bool pre_cast, bool post_cast) {
   using tag = memory::format_tag;
   using dt = memory::data_type;
   engine eng(engine::kind::cpu, 0);
@@ -64,46 +91,89 @@ void dnnl_conv2d_common(float* data, float* weights, float* bias, float* out, in
   memory::dims conv2d_weights_tz = {p_O_, p_C_, p_Kh_, p_Kw_};
   if (p_G_ > 1) conv2d_weights_tz = {p_G_, 1, p_C_ / p_G_, p_Kh_, p_Kw_};
   memory::dims conv2d_bias_tz = {p_O_};
-  memory::dims conv2d_dst_tz = {p_N_, p_O_, (p_H_ - p_Kh_ + 2 * p_Ph_ + p_Sh_) / p_Sh_,
-                                (p_W_ - p_Kw_ + 2 * p_Pw_ + p_Sw_) / p_Sw_};
+  memory::dims conv2d_dst_tz = {p_N_, p_O_, (p_H_ - p_Kh_ + p_Ph0_ + p_Ph1_ + p_Sh_) / p_Sh_,
+                                (p_W_ - p_Kw_ + p_Pw0_ + p_Pw1_ + p_Sw_) / p_Sw_};
   memory::dims conv2d_strides = {p_Sh_, p_Sw_};
-  memory::dims conv2d_padding = {p_Ph_, p_Pw_};
+  memory::dims conv2d_padding0 = {p_Ph0_, p_Pw0_};
+  memory::dims conv2d_padding1 = {p_Ph1_, p_Pw1_};
 
-  auto user_src_memory = memory({{conv2d_src_tz}, dt::f32, tag::nchw}, eng, data);
-  auto user_weights_memory =
-      memory({{conv2d_weights_tz}, dt::f32, (p_G_ > 1) ? tag::goihw : tag::oihw}, eng, weights);
-  auto conv2d_user_bias_memory = memory({{conv2d_bias_tz}, dt::f32, tag::x}, eng, bias);
+  auto user_src_memory =
+      memory({{conv2d_src_tz}, pre_cast ? dt::f32 : dt::bf16, channel_last ? tag::nhwc : tag::nchw},
+             eng, data);
+  auto user_weights_memory = memory({{conv2d_weights_tz},
+                                     (pre_cast && post_cast) ? dt::f32 : dt::bf16,
+                                     channel_last ? tag::hwio : tag::oihw},
+                                    eng, weights);
+  if (p_G_ > 1)
+    user_weights_memory = memory({{conv2d_weights_tz},
+                                  (pre_cast && post_cast) ? dt::f32 : dt::bf16,
+                                  channel_last ? tag::ghwio : tag::goihw},
+                                 eng, weights);
+  auto conv2d_user_bias_memory =
+      memory({{conv2d_bias_tz}, (pre_cast && post_cast) ? dt::f32 : dt::bf16, tag::x}, eng, bias);
+  auto user_dst_memory = memory(
+      {{conv2d_dst_tz}, post_cast ? dt::f32 : dt::bf16, channel_last ? tag::nhwc : tag::nchw}, eng,
+      out);
 
-  auto conv2d_src_md = memory::desc({conv2d_src_tz}, dt::f32, tag::any);
-  auto conv2d_bias_md = memory::desc({conv2d_bias_tz}, dt::f32, tag::any);
-  auto conv2d_weights_md = memory::desc({conv2d_weights_tz}, dt::f32, tag::any);
-  auto conv2d_dst_md = memory::desc({conv2d_dst_tz}, dt::f32, tag::nchw);
+  auto conv2d_src_md =
+      memory::desc({conv2d_src_tz}, (pre_cast && post_cast) ? dt::f32 : dt::bf16, tag::any);
+  auto conv2d_bias_md =
+      memory::desc({conv2d_bias_tz}, (pre_cast && post_cast) ? dt::f32 : dt::bf16, tag::any);
+  auto conv2d_weights_md =
+      memory::desc({conv2d_weights_tz}, (pre_cast && post_cast) ? dt::f32 : dt::bf16, tag::any);
+  auto conv2d_dst_md =
+      memory::desc({conv2d_dst_tz}, (pre_cast && post_cast) ? dt::f32 : dt::bf16, tag::any);
 
   auto conv2d_desc = convolution_forward::desc(
       prop_kind::forward_inference, algorithm::convolution_direct, conv2d_src_md, conv2d_weights_md,
-      conv2d_bias_md, conv2d_dst_md, conv2d_strides, conv2d_padding, conv2d_padding);
+      conv2d_bias_md, conv2d_dst_md, conv2d_strides, conv2d_padding0, conv2d_padding1);
   auto conv2d_prim_desc = convolution_forward::primitive_desc(conv2d_desc, attr, eng);
 
+  // reorder if src layout not DNNL chosen.
   auto conv2d_src_memory = user_src_memory;
+  if (conv2d_prim_desc.src_desc() != user_src_memory.get_desc()) {
+    conv2d_src_memory = memory(conv2d_prim_desc.src_desc(), eng);
+    auto reorder_src = reorder(user_src_memory, conv2d_src_memory);
+    reorder_src.execute(s, {{DNNL_ARG_FROM, user_src_memory}, {DNNL_ARG_TO, conv2d_src_memory}});
+  }
+
+  // reorder if weights layout not DNNL chosen.
   auto conv2d_weights_memory = user_weights_memory;
-  auto conv2d_dst_memory = memory(conv2d_prim_desc.dst_desc(), eng);
+  if (conv2d_prim_desc.weights_desc() != user_weights_memory.get_desc()) {
+    conv2d_weights_memory = memory(conv2d_prim_desc.weights_desc(), eng);
+    auto reorder_weights = reorder(user_weights_memory, conv2d_weights_memory);
+    reorder_weights.execute(
+        s, {{DNNL_ARG_FROM, user_weights_memory}, {DNNL_ARG_TO, conv2d_weights_memory}});
+  }
+
+  auto conv2d_dst_memory = user_dst_memory;
+  if (conv2d_prim_desc.dst_desc() != user_dst_memory.get_desc()) {
+    conv2d_dst_memory = memory(conv2d_prim_desc.dst_desc(), eng);
+  }
 
   auto conv = convolution_forward(conv2d_prim_desc);
   conv.execute(s, {{DNNL_ARG_SRC, conv2d_src_memory},
                    {DNNL_ARG_WEIGHTS, conv2d_weights_memory},
                    {DNNL_ARG_BIAS, conv2d_user_bias_memory},
                    {DNNL_ARG_DST, conv2d_dst_memory}});
+
+  // reorder if dst layout not DNNL chosen.
+  if (conv2d_prim_desc.dst_desc() != user_dst_memory.get_desc()) {
+    reorder(conv2d_dst_memory, user_dst_memory)
+        .execute(s, {{DNNL_ARG_FROM, conv2d_dst_memory}, {DNNL_ARG_TO, user_dst_memory}});
+  }
+
   s.wait();
-  read_from_dnnl_memory(out, conv2d_dst_memory);
 }
 
 extern "C" void dnnl_conv2d(float* data, float* weights, float* out, int p_N_, int p_C_, int p_H_,
-                            int p_W_, int p_O_, int p_G_, int p_Ph_, int p_Pw_, int p_Kh_,
-                            int p_Kw_, int p_Sh_, int p_Sw_) {
+                            int p_W_, int p_O_, int p_G_, int p_Ph0_, int p_Pw0_, int p_Ph1_,
+                            int p_Pw1_, int p_Kh_, int p_Kw_, int p_Sh_, int p_Sw_) {
   primitive_attr attr;
   std::vector<float> bias(p_O_, 0);
   return dnnl_conv2d_common(data, weights, bias.data(), out, p_N_, p_C_, p_H_, p_W_, p_O_, p_G_,
-                            p_Ph_, p_Pw_, p_Kh_, p_Kw_, p_Sh_, p_Sw_, attr);
+                            p_Ph0_, p_Pw0_, p_Ph1_, p_Pw1_, p_Kh_, p_Kw_, p_Sh_, p_Sw_, attr, false,
+                            true, true);
 }
 
 primitive_attr create_attr_with_relu_post_op() {
@@ -117,20 +187,23 @@ primitive_attr create_attr_with_relu_post_op() {
 }
 
 extern "C" void dnnl_fused_conv2d_relu(float* data, float* weights, float* out, int p_N_, int p_C_,
-                                       int p_H_, int p_W_, int p_O_, int p_G_, int p_Ph_, int p_Pw_,
-                                       int p_Kh_, int p_Kw_, int p_Sh_, int p_Sw_) {
+                                       int p_H_, int p_W_, int p_O_, int p_G_, int p_Ph0_,
+                                       int p_Pw0_, int p_Ph1_, int p_Pw1_, int p_Kh_, int p_Kw_,
+                                       int p_Sh_, int p_Sw_) {
   std::vector<float> bias(p_O_, 0);
   return dnnl_conv2d_common(data, weights, bias.data(), out, p_N_, p_C_, p_H_, p_W_, p_O_, p_G_,
-                            p_Ph_, p_Pw_, p_Kh_, p_Kw_, p_Sh_, p_Sw_,
-                            create_attr_with_relu_post_op());
+                            p_Ph0_, p_Pw0_, p_Ph1_, p_Pw1_, p_Kh_, p_Kw_, p_Sh_, p_Sw_,
+                            create_attr_with_relu_post_op(), false, true, true);
 }
 
 extern "C" void dnnl_fused_conv2d_bias_relu(float* data, float* weights, float* bias, float* out,
                                             int p_N_, int p_C_, int p_H_, int p_W_, int p_O_,
-                                            int p_G_, int p_Ph_, int p_Pw_, int p_Kh_, int p_Kw_,
-                                            int p_Sh_, int p_Sw_) {
-  return dnnl_conv2d_common(data, weights, bias, out, p_N_, p_C_, p_H_, p_W_, p_O_, p_G_, p_Ph_,
-                            p_Pw_, p_Kh_, p_Kw_, p_Sh_, p_Sw_, create_attr_with_relu_post_op());
+                                            int p_G_, int p_Ph0_, int p_Pw0_, int p_Ph1_,
+                                            int p_Pw1_, int p_Kh_, int p_Kw_, int p_Sh_,
+                                            int p_Sw_) {
+  return dnnl_conv2d_common(data, weights, bias, out, p_N_, p_C_, p_H_, p_W_, p_O_, p_G_, p_Ph0_,
+                            p_Pw0_, p_Ph1_, p_Pw1_, p_Kh_, p_Kw_, p_Sh_, p_Sw_,
+                            create_attr_with_relu_post_op(), false, true, true);
 }
 
 extern "C" void dnnl_dense(float* data, float* weight, float* out, int p_B_, int p_I_, int p_O_) {
@@ -170,16 +243,13 @@ extern "C" void dnnl_dense(float* data, float* weight, float* out, int p_B_, int
   read_from_dnnl_memory(out, dst_memory);
 }
 
-extern "C" void dnnl_relu(float* data, float* out, int p_N_, int p_C_, int p_H_, int p_W_) {
-  using tag = memory::format_tag;
+extern "C" void dnnl_relu(float* data, float* out, std::vector<int64_t> shape) {
   using dt = memory::data_type;
 
   engine eng(engine::kind::cpu, 0);
   stream s(eng);
 
-  memory::dims data_tz = {p_N_, p_C_, p_H_, p_W_};
-
-  auto data_md = memory::desc{{data_tz}, dt::f32, tag::nchw};
+  auto data_md = GenDNNLMemDescByShape(shape, dt::f32);
 
   auto data_memory = memory(data_md, eng, data);
   auto dst_memory = memory(data_md, eng);
@@ -236,27 +306,39 @@ extern "C" void dnnl_bn(float* data, float* gamma, float* beta, float* mean, flo
   free(weight);
 }
 
-extern "C" void dnnl_add(float* data, float* weight, float* out, int p_N_, int p_C_, int p_H_,
-                         int p_W_) {
-  using tag = memory::format_tag;
+// should comply with src/relay/backend/contrib/dnnl/codegen.cc
+#define DNNL_BINARY_ADD 0
+#define DNNL_BINARY_MUL 1
+
+extern "C" void dnnl_binary_op(float* data, float* weight, float* out, int algo_type,
+                               std::vector<int64_t> shape) {
   using dt = memory::data_type;
 
   engine eng(engine::kind::cpu, 0);
   stream s(eng);
 
-  memory::dims data_tz = {p_N_, p_C_, p_H_, p_W_};
-
-  auto data_md = memory::desc{{data_tz}, dt::f32, tag::nchw};
-  auto weight_md = memory::desc({{data_tz}, dt::f32, tag::nchw});
-  auto dst_md = memory::desc({{data_tz}, dt::f32, tag::nchw});
+  auto data_md = GenDNNLMemDescByShape(shape, dt::f32);
 
   auto data_memory = memory(data_md, eng, data);
-  auto weight_memory = memory(weight_md, eng, weight);
-  auto dst_memory = memory(dst_md, eng);
+  auto weight_memory = memory(data_md, eng, weight);
+  auto dst_memory = memory(data_md, eng);
 
-  auto add_desc = binary::desc(algorithm::binary_add, data_md, weight_md, dst_md);
+  algorithm algo = algorithm::undef;
+  switch (algo_type) {
+    case DNNL_BINARY_ADD:
+      algo = algorithm::binary_add;
+      break;
+    case DNNL_BINARY_MUL:
+      algo = algorithm::binary_mul;
+      break;
+    default:
+      LOG(FATAL) << "Unsupported dnnl algorithm: " << algo_type;
+      break;
+  }
+
+  auto add_desc = binary::desc(algo, data_md, data_md, data_md);
   auto add_prim_desc = binary::primitive_desc(add_desc, eng);
-  assert(dst_md == add_prim_desc.dst_desc());
+  assert(data_md == add_prim_desc.dst_desc());
 
   auto add = binary(add_prim_desc);
   add.execute(
@@ -265,6 +347,39 @@ extern "C" void dnnl_add(float* data, float* weight, float* out, int p_N_, int p
   s.wait();
   read_from_dnnl_memory(out, dst_memory);
 }
+
+// DNNL Conv2d single OP
+TVM_REGISTER_GLOBAL("tvm.contrib.dnnl.conv2d").set_body([](TVMArgs args, TVMRetValue* ret) {
+  DLTensor* input = args[0];
+  DLTensor* weights = args[1];
+  DLTensor* output = args[2];
+  int p_Ph0_ = args[3], p_Pw0_ = args[4], p_Ph1_ = args[5], p_Pw1_ = args[6], p_Sh_ = args[7],
+      p_Sw_ = args[8], p_G_ = args[9];
+  bool channel_last = args[10];
+  bool pre_cast = args[11];
+  bool post_cast = args[12];
+
+  int p_N_ = input->shape[0], p_C_ = input->shape[1], p_H_ = input->shape[2],
+      p_W_ = input->shape[3], p_O_ = output->shape[1], p_Kh_ = weights->shape[2],
+      p_Kw_ = weights->shape[3];
+
+  if (channel_last) {
+    p_N_ = input->shape[0];
+    p_H_ = input->shape[1];
+    p_W_ = input->shape[2];
+    p_C_ = input->shape[3];
+    p_O_ = output->shape[3];
+    p_Kh_ = weights->shape[0];
+    p_Kw_ = weights->shape[1];
+  }
+
+  std::vector<float> bias(p_O_, 0);
+  primitive_attr attr;
+  return dnnl_conv2d_common(static_cast<float*>(input->data), static_cast<float*>(weights->data),
+                            bias.data(), static_cast<float*>(output->data), p_N_, p_C_, p_H_, p_W_,
+                            p_O_, p_G_, p_Ph0_, p_Pw0_, p_Ph1_, p_Pw1_, p_Kh_, p_Kw_, p_Sh_, p_Sw_,
+                            attr, channel_last, pre_cast, post_cast);
+});
 
 }  // namespace contrib
 }  // namespace runtime

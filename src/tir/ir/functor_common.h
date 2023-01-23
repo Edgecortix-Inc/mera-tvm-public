@@ -16,6 +16,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+#include <tvm/runtime/container/array.h>
+
 /*!
  * \file tir/ir/functor_common.h
  * \brief Common utils for implementing functors
@@ -36,8 +38,7 @@ inline void VisitArray(const Array<T>& arr, F fvisit) {
 
 template <typename T, typename F>
 inline Array<T> MutateArray(Array<T> arr, F fmutate) {
-  arr.MutateByApply(fmutate);
-  return arr;
+  return arr.Map(fmutate);
 }
 
 }  // namespace tir

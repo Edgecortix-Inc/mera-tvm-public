@@ -14,288 +14,366 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-# pylint: disable=invalid-name, too-many-locals, too-many-statements, unused-argument
-"""Test workload for lowering and build"""
-import tvm
-from tvm import tir
-from tvm.script import ty
-import tvm.testing
+"""Test workload for lowering and build."""
 import numpy as np
 
+import tvm
+import tvm.testing
+from tvm.script import tir as T
 
-@tvm.script.tir
-def tensorcore_gemm(a: ty.handle, b: ty.handle, c: ty.handle) -> None:
+
+@T.prim_func
+def tensorcore_gemm(handle_a: T.handle, handle_b: T.handle, handle_c: T.handle) -> None:
+    # pylint: disable=missing-function-docstring
     # match buffer
-    A = tir.match_buffer(a, [1024, 1024], "float16")
-    B = tir.match_buffer(b, [1024, 1024], "float16")
-    C = tir.match_buffer(c, [1024, 1024], "float32")
+    match_buffer_a = T.match_buffer(handle_a, [1024, 1024], "float16")
+    match_buffer_b = T.match_buffer(handle_b, [1024, 1024], "float16")
+    match_buffer_c = T.match_buffer(handle_c, [1024, 1024], "float32")
 
     # body
-    for blockIdx_x in tir.thread_binding(0, 16, "blockIdx.x"):
-        for blockIdx_y in tir.thread_binding(0, 8, "blockIdx.y"):
-            with tir.block([16, 8]) as [bx, by]:
-                tir.bind(bx, blockIdx_x)
-                tir.bind(by, blockIdx_y)
-                shared_A = tir.alloc_buffer([1024, 1024], "float16", scope="shared")
-                shared_B = tir.alloc_buffer([1024, 1024], "float16", scope="shared")
-                wmma_A = tir.alloc_buffer([1024, 1024], "float16", scope="wmma.matrix_a")
-                wmma_B = tir.alloc_buffer([1024, 1024], "float16", scope="wmma.matrix_b")
-                wmma_C = tir.alloc_buffer([1024, 1024], "float32", scope="wmma.accumulator")
-                for ty in tir.thread_binding(0, 2, "threadIdx.y"):
-                    for tz in tir.thread_binding(0, 2, "threadIdx.z"):
-                        for i, j in tir.grid(2, 4):
-                            with tir.block([64, 64]) as [vi, vj]:
-                                tir.bind(vi, bx * 4 + ty * 2 + i)
-                                tir.bind(vj, by * 8 + tz * 4 + j)
-                                tir.reads([])
-                                tir.writes(wmma_C[vi * 16 : vi * 16 + 16, vj * 16 : vj * 16 + 16])
-                                C0 = tir.match_buffer(
-                                    wmma_C[vi * 16 : vi * 16 + 16, vj * 16 : vj * 16 + 16],
+    for block_idx_x in T.thread_binding(0, 16, "blockIdx.x"):
+        for block_idx_y in T.thread_binding(0, 8, "blockIdx.y"):
+            with T.block():
+                axis_bx, axis_by = T.axis.remap("SS", [block_idx_x, block_idx_y])
+                shared_a = T.alloc_buffer([1024, 1024], "float16", scope="shared")
+                shared_b = T.alloc_buffer([1024, 1024], "float16", scope="shared")
+                wmma_a = T.alloc_buffer([1024, 1024], "float16", scope="wmma.matrix_a")
+                wmma_b = T.alloc_buffer([1024, 1024], "float16", scope="wmma.matrix_b")
+                wmma_c = T.alloc_buffer([1024, 1024], "float32", scope="wmma.accumulator")
+
+                # pylint: disable=too-many-nested-blocks
+                for thread_ty in T.thread_binding(0, 2, "threadIdx.y"):
+                    for thread_tz in T.thread_binding(0, 2, "threadIdx.z"):
+                        for index_i, index_jj in T.grid(2, 4):
+                            with T.block():
+                                new_axis_vi = T.axis.S(64, axis_bx * 4 + thread_ty * 2 + index_i)
+                                new_axis_vj = T.axis.S(64, axis_by * 8 + thread_tz * 4 + index_jj)
+                                T.reads([])
+                                T.writes(
+                                    wmma_c[
+                                        new_axis_vi * 16 : new_axis_vi * 16 + 16,
+                                        new_axis_vj * 16 : new_axis_vj * 16 + 16,
+                                    ]
+                                )
+                                match_buffer_c0 = T.match_buffer(
+                                    wmma_c[
+                                        new_axis_vi * 16 : new_axis_vi * 16 + 16,
+                                        new_axis_vj * 16 : new_axis_vj * 16 + 16,
+                                    ],
                                     (16, 16),
                                     "float32",
                                     strides=[16 * 4, 1],
                                     scope="wmma.accumulator",
                                     offset_factor=1,
                                 )
-                                tir.evaluate(
-                                    tir.tvm_fill_fragment(
-                                        C0.data,
+                                T.evaluate(
+                                    T.tvm_fill_fragment(
+                                        match_buffer_c0.data,
                                         16,
                                         16,
                                         16,
-                                        i * 4 + j,
-                                        tir.float32(0),
+                                        index_i * 4 + index_jj,
+                                        T.float32(0),  # pylint: disable=not-callable
                                         dtype="handle",
                                     )
                                 )
 
-                        for ko in range(0, 32):
+                        for k_o in range(0, 32):
                             # copy data from global to shared
-                            for tx in tir.thread_binding(0, 32, "threadIdx.x"):
-                                for i0, j0 in tir.grid(1, 4):
-                                    for j1 in tir.vectorized(0, 4):
-                                        with tir.block([1024, 1024]) as [vi, vj]:
-                                            tir.bind(vi, bx * 64 + ty * 32 + tx + i0)
-                                            tir.bind(vj, ko * 32 + tz * 16 + j0 * 4 + j1)
-                                            shared_A[vi, vj + 8] = A[vi, vj]
+                            for thread_tx in T.thread_binding(0, 32, "threadIdx.x"):
+                                for index_i0, index_j0 in T.grid(1, 4):
+                                    for index_j1 in T.vectorized(0, 4):
+                                        with T.block():
+                                            new_axis_vi = T.axis.S(
+                                                1024,
+                                                axis_bx * 64
+                                                + thread_ty * 32
+                                                + thread_tx
+                                                + index_i0,
+                                            )
+                                            new_axis_vj = T.axis.S(
+                                                1024,
+                                                k_o * 32 + thread_tz * 16 + index_j0 * 4 + index_j1,
+                                            )
+                                            shared_a[new_axis_vi, new_axis_vj + 8] = match_buffer_a[
+                                                new_axis_vi, new_axis_vj
+                                            ]
 
-                                for i0, j0 in tir.grid(2, 4):
-                                    for j1 in tir.vectorized(0, 4):
-                                        with tir.block([1024, 1024]) as [vi, vj]:
-                                            tir.bind(vi, by * 128 + ty * 64 + tx * 2 + i0)
-                                            tir.bind(vj, ko * 32 + tz * 16 + j0 * 4 + j1)
-                                            shared_B[vi, vj + 8] = B[vi, vj]
+                                for index_i0, index_j0 in T.grid(2, 4):
+                                    for index_j1 in T.vectorized(0, 4):
+                                        with T.block():
+                                            new_axis_vi = T.axis.S(
+                                                1024,
+                                                axis_by * 128
+                                                + thread_ty * 64
+                                                + thread_tx * 2
+                                                + index_i0,
+                                            )
+                                            new_axis_vj = T.axis.S(
+                                                1024,
+                                                k_o * 32 + thread_tz * 16 + index_j0 * 4 + index_j1,
+                                            )
+                                            shared_b[new_axis_vi, new_axis_vj + 8] = match_buffer_b[
+                                                new_axis_vi, new_axis_vj
+                                            ]
 
-                            for ki in range(0, 2):
-                                for i in range(0, 2):
-                                    with tir.block([64, 64]) as [vi, vk]:
-                                        tir.bind(vi, bx * 4 + ty * 2 + i)
-                                        tir.bind(vk, ko * 2 + ki)
-                                        tir.reads(
-                                            shared_A[
-                                                vi * 16 : vi * 16 + 16,
-                                                vk * 16 : vk * 16 + 16 + 8,
+                            for k_i in range(0, 2):
+                                for index_i in range(0, 2):
+                                    with T.block():
+                                        new_axis_vi = T.axis.S(
+                                            64, axis_bx * 4 + thread_ty * 2 + index_i
+                                        )
+                                        axis_vk = T.axis.S(64, k_o * 2 + k_i)
+                                        T.reads(
+                                            shared_a[
+                                                new_axis_vi * 16 : new_axis_vi * 16 + 16,
+                                                axis_vk * 16 : axis_vk * 16 + 16 + 8,
                                             ]
                                         )
-                                        tir.writes(
-                                            wmma_A[vi * 16 : vi * 16 + 16, vk * 16 : vk * 16 + 16]
+                                        T.writes(
+                                            wmma_a[
+                                                new_axis_vi * 16 : new_axis_vi * 16 + 16,
+                                                axis_vk * 16 : axis_vk * 16 + 16,
+                                            ]
                                         )
-                                        s0 = tir.var("int32")
-                                        s1 = tir.var("int32")
-                                        A0 = tir.match_buffer(
-                                            shared_A[
-                                                vi * 16 : vi * 16 + 16,
-                                                vk * 16 : vk * 16 + 16 + 8,
+                                        stride0 = T.var("int32")
+                                        stride1 = T.var("int32")
+                                        match_buffer_a0 = T.match_buffer(
+                                            shared_a[
+                                                new_axis_vi * 16 : new_axis_vi * 16 + 16,
+                                                axis_vk * 16 : axis_vk * 16 + 16 + 8,
                                             ],
                                             (16, 16 + 8),
                                             "float16",
-                                            strides=[s0, s1],
+                                            strides=[stride0, stride1],
                                             scope="shared",
                                             offset_factor=1,
                                         )
-                                        wmma_A0 = tir.match_buffer(
-                                            wmma_A[vi * 16 : vi * 16 + 16, vk * 16 : vk * 16 + 16],
+                                        wmma_a0 = T.match_buffer(
+                                            wmma_a[
+                                                new_axis_vi * 16 : new_axis_vi * 16 + 16,
+                                                axis_vk * 16 : axis_vk * 16 + 16,
+                                            ],
                                             (16, 16),
                                             "float16",
                                             strides=[16, 1],
                                             scope="wmma.matrix_a",
                                             offset_factor=1,
                                         )
-                                        tir.evaluate(
-                                            tir.tvm_load_matrix_sync(
-                                                wmma_A0.data,
+                                        T.evaluate(
+                                            T.tvm_load_matrix_sync(
+                                                wmma_a0.data,
                                                 16,
                                                 16,
                                                 16,
-                                                i,
-                                                tir.tvm_access_ptr(
-                                                    tir.type_annotation(dtype="float16"),
-                                                    A0.data,
-                                                    A0.elem_offset + 8,
-                                                    A0.strides[0],
+                                                index_i,
+                                                T.tvm_access_ptr(
+                                                    T.type_annotation(dtype="float16"),
+                                                    match_buffer_a0.data,
+                                                    match_buffer_a0.elem_offset + 8,
+                                                    match_buffer_a0.strides[0],
                                                     1,
                                                     dtype="handle",
                                                 ),
-                                                A0.strides[0],
+                                                match_buffer_a0.strides[0],
                                                 "row_major",
                                                 dtype="handle",
                                             )
                                         )
-                                for j in range(0, 4):
-                                    with tir.block([64, 64]) as [vj, vk]:
-                                        tir.bind(vj, by * 8 + tz * 4 + j)
-                                        tir.bind(vk, ko * 2 + ki)
-                                        tir.reads(
-                                            shared_B[
-                                                vj * 16 : vj * 16 + 16,
-                                                vk * 16 : vk * 16 + 16 + 8,
+                                for index_jj in range(0, 4):
+                                    with T.block():
+                                        new_axis_vj = T.axis.S(
+                                            64, axis_by * 8 + thread_tz * 4 + index_jj
+                                        )
+                                        axis_vk = T.axis.S(64, k_o * 2 + k_i)
+                                        T.reads(
+                                            shared_b[
+                                                new_axis_vj * 16 : new_axis_vj * 16 + 16,
+                                                axis_vk * 16 : axis_vk * 16 + 16 + 8,
                                             ]
                                         )
-                                        tir.writes(
-                                            wmma_B[vj * 16 : vj * 16 + 16, vk * 16 : vk * 16 + 16]
+                                        T.writes(
+                                            wmma_b[
+                                                new_axis_vj * 16 : new_axis_vj * 16 + 16,
+                                                axis_vk * 16 : axis_vk * 16 + 16,
+                                            ]
                                         )
-                                        s0 = tir.var("int32")
-                                        s1 = tir.var("int32")
-                                        B0 = tir.match_buffer(
-                                            shared_B[
-                                                vj * 16 : vj * 16 + 16,
-                                                vk * 16 : vk * 16 + 16 + 8,
+                                        stride0 = T.var("int32")
+                                        stride1 = T.var("int32")
+                                        match_buffer_b0 = T.match_buffer(
+                                            shared_b[
+                                                new_axis_vj * 16 : new_axis_vj * 16 + 16,
+                                                axis_vk * 16 : axis_vk * 16 + 16 + 8,
                                             ],
                                             (16, 16 + 8),
                                             "float16",
-                                            strides=[s0, s1],
+                                            strides=[stride0, stride1],
                                             scope="shared",
                                             offset_factor=1,
                                         )
-                                        wmma_B0 = tir.match_buffer(
-                                            wmma_B[vj * 16 : vj * 16 + 16, vk * 16 : vk * 16 + 16],
+                                        wmma_b0 = T.match_buffer(
+                                            wmma_b[
+                                                new_axis_vj * 16 : new_axis_vj * 16 + 16,
+                                                axis_vk * 16 : axis_vk * 16 + 16,
+                                            ],
                                             (16, 16),
                                             "float16",
                                             strides=[16, 1],
                                             scope="wmma.matrix_b",
                                             offset_factor=1,
                                         )
-                                        tir.evaluate(
-                                            tir.tvm_load_matrix_sync(
-                                                wmma_B0.data,
+                                        T.evaluate(
+                                            T.tvm_load_matrix_sync(
+                                                wmma_b0.data,
                                                 16,
                                                 16,
                                                 16,
-                                                j,
-                                                tir.tvm_access_ptr(
-                                                    tir.type_annotation(dtype="float16"),
-                                                    B0.data,
-                                                    B0.elem_offset + 8,
-                                                    B0.strides[0],
+                                                index_jj,
+                                                T.tvm_access_ptr(
+                                                    T.type_annotation(dtype="float16"),
+                                                    match_buffer_b0.data,
+                                                    match_buffer_b0.elem_offset + 8,
+                                                    match_buffer_b0.strides[0],
                                                     1,
                                                     dtype="handle",
                                                 ),
-                                                B0.strides[0],
+                                                match_buffer_b0.strides[0],
                                                 "col_major",
                                                 dtype="handle",
                                             )
                                         )
-                                for i, j in tir.grid(2, 4):
-                                    with tir.block([64, 64, tir.reduce_axis(0, 64)]) as [
-                                        vi,
-                                        vj,
-                                        vk,
-                                    ]:
-                                        tir.bind(vi, bx * 4 + ty * 2 + i)
-                                        tir.bind(vj, by * 8 + tz * 4 + j)
-                                        tir.bind(vk, ko * 2 + ki)
-                                        tir.reads(
+                                for index_i, index_jj in T.grid(2, 4):
+                                    with T.block():
+                                        new_axis_vi = T.axis.S(
+                                            64, axis_bx * 4 + thread_ty * 2 + index_i
+                                        )
+                                        new_axis_vj = T.axis.S(
+                                            64, axis_by * 8 + thread_tz * 4 + index_jj
+                                        )
+                                        axis_vk = T.axis.R(64, k_o * 2 + k_i)
+                                        T.reads(
                                             [
-                                                wmma_A[
-                                                    vi * 16 : vi * 16 + 16, vk * 16 : vk * 16 + 16
+                                                wmma_a[
+                                                    new_axis_vi * 16 : new_axis_vi * 16 + 16,
+                                                    axis_vk * 16 : axis_vk * 16 + 16,
                                                 ],
-                                                wmma_B[
-                                                    vj * 16 : vj * 16 + 16, vk * 16 : vk * 16 + 16
+                                                wmma_b[
+                                                    new_axis_vj * 16 : new_axis_vj * 16 + 16,
+                                                    axis_vk * 16 : axis_vk * 16 + 16,
                                                 ],
-                                                wmma_C[
-                                                    vi * 16 : vi * 16 + 16, vj * 16 : vj * 16 + 16
+                                                wmma_c[
+                                                    new_axis_vi * 16 : new_axis_vi * 16 + 16,
+                                                    new_axis_vj * 16 : new_axis_vj * 16 + 16,
                                                 ],
                                             ]
                                         )
-                                        tir.writes(
-                                            wmma_C[vi * 16 : vi * 16 + 16, vj * 16 : vj * 16 + 16]
+                                        T.writes(
+                                            wmma_c[
+                                                new_axis_vi * 16 : new_axis_vi * 16 + 16,
+                                                new_axis_vj * 16 : new_axis_vj * 16 + 16,
+                                            ]
                                         )
-                                        wmma_A1 = tir.match_buffer(
-                                            wmma_A[vi * 16 : vi * 16 + 16, vk * 16 : vk * 16 + 16],
+                                        wmma_a1 = T.match_buffer(
+                                            wmma_a[
+                                                new_axis_vi * 16 : new_axis_vi * 16 + 16,
+                                                axis_vk * 16 : axis_vk * 16 + 16,
+                                            ],
                                             (16, 16),
                                             "float16",
                                             strides=[16, 1],
                                             scope="wmma.matrix_a",
                                             offset_factor=1,
                                         )
-                                        wmma_B1 = tir.match_buffer(
-                                            wmma_B[vj * 16 : vj * 16 + 16, vk * 16 : vk * 16 + 16],
+                                        wmma_b1 = T.match_buffer(
+                                            wmma_b[
+                                                new_axis_vj * 16 : new_axis_vj * 16 + 16,
+                                                axis_vk * 16 : axis_vk * 16 + 16,
+                                            ],
                                             (16, 16),
                                             "float16",
                                             strides=[16, 1],
                                             scope="wmma.matrix_b",
                                             offset_factor=1,
                                         )
-                                        wmma_C1 = tir.match_buffer(
-                                            wmma_C[vi * 16 : vi * 16 + 16, vj * 16 : vj * 16 + 16],
+                                        wmma_c1 = T.match_buffer(
+                                            wmma_c[
+                                                new_axis_vi * 16 : new_axis_vi * 16 + 16,
+                                                new_axis_vj * 16 : new_axis_vj * 16 + 16,
+                                            ],
                                             (16, 16),
                                             "float32",
                                             strides=[16 * 4, 1],
                                             scope="wmma.accumulator",
                                             offset_factor=1,
                                         )
-                                        tir.evaluate(
-                                            tir.tvm_mma_sync(
-                                                wmma_C1.data,
-                                                i * 4 + j,
-                                                wmma_A1.data,
-                                                i,
-                                                wmma_B1.data,
-                                                j,
-                                                wmma_C1.data,
-                                                i * 4 + j,
+                                        T.evaluate(
+                                            T.tvm_mma_sync(
+                                                wmma_c1.data,
+                                                index_i * 4 + index_jj,
+                                                wmma_a1.data,
+                                                index_i,
+                                                wmma_b1.data,
+                                                index_jj,
+                                                wmma_c1.data,
+                                                index_i * 4 + index_jj,
                                                 dtype="handle",
                                             )
                                         )
-                        for i, j in tir.grid(2, 4):
-                            with tir.block([64, 64]) as [vi, vj]:
-                                tir.bind(vi, bx * 4 + ty * 2 + i)
-                                tir.bind(vj, by * 8 + tz * 4 + j)
-                                tir.reads(wmma_C[vi * 16 : vi * 16 + 16, vj * 16 : vj * 16 + 16])
-                                tir.writes(C[vi * 16 : vi * 16 + 16, vj * 16 : vj * 16 + 16])
-                                s0 = tir.var("int32")
-                                s1 = tir.var("int32")
-                                wmma_C2 = tir.match_buffer(
-                                    wmma_C[vi * 16 : vi * 16 + 16, vj * 16 : vj * 16 + 16],
+                        for index_i, index_jj in T.grid(2, 4):
+                            with T.block():
+                                new_axis_vi = T.axis.S(64, axis_bx * 4 + thread_ty * 2 + index_i)
+                                new_axis_vj = T.axis.S(64, axis_by * 8 + thread_tz * 4 + index_jj)
+                                T.reads(
+                                    wmma_c[
+                                        new_axis_vi * 16 : new_axis_vi * 16 + 16,
+                                        new_axis_vj * 16 : new_axis_vj * 16 + 16,
+                                    ]
+                                )
+                                T.writes(
+                                    match_buffer_c[
+                                        new_axis_vi * 16 : new_axis_vi * 16 + 16,
+                                        new_axis_vj * 16 : new_axis_vj * 16 + 16,
+                                    ]
+                                )
+                                stride0 = T.var("int32")
+                                stride1 = T.var("int32")
+                                wmma_c2 = T.match_buffer(
+                                    wmma_c[
+                                        new_axis_vi * 16 : new_axis_vi * 16 + 16,
+                                        new_axis_vj * 16 : new_axis_vj * 16 + 16,
+                                    ],
                                     (16, 16),
                                     "float32",
                                     strides=[16 * 4, 1],
                                     scope="wmma.accumulator",
                                     offset_factor=1,
                                 )
-                                C1 = tir.match_buffer(
-                                    C[vi * 16 : vi * 16 + 16, vj * 16 : vj * 16 + 16],
+                                match_buffer_c1 = T.match_buffer(
+                                    match_buffer_c[
+                                        new_axis_vi * 16 : new_axis_vi * 16 + 16,
+                                        new_axis_vj * 16 : new_axis_vj * 16 + 16,
+                                    ],
                                     (16, 16),
                                     "float32",
-                                    strides=[s0, s1],
+                                    strides=[stride0, stride1],
                                     offset_factor=1,
                                 )
-                                tir.evaluate(
-                                    tir.tvm_store_matrix_sync(
-                                        wmma_C2.data,
+                                T.evaluate(
+                                    T.tvm_store_matrix_sync(
+                                        wmma_c2.data,
                                         16,
                                         16,
                                         16,
-                                        i * 4 + j,
-                                        tir.tvm_access_ptr(
-                                            tir.type_annotation(dtype="float32"),
-                                            C1.data,
-                                            C1.elem_offset,
-                                            C1.strides[0],
+                                        index_i * 4 + index_jj,
+                                        T.tvm_access_ptr(
+                                            T.type_annotation(dtype="float32"),
+                                            match_buffer_c1.data,
+                                            match_buffer_c1.elem_offset,
+                                            match_buffer_c1.strides[0],
                                             1,
                                             dtype="handle",
                                         ),
-                                        C1.strides[0],
+                                        match_buffer_c1.strides[0],
                                         "row_major",
                                         dtype="handle",
                                     )
@@ -304,22 +382,23 @@ def tensorcore_gemm(a: ty.handle, b: ty.handle, c: ty.handle) -> None:
 
 @tvm.testing.requires_cuda
 def test_gemm_tensorcore():
+    """Test running gemm on tensorcore."""
     dev = tvm.device("cuda", 0)
     a_np = np.random.uniform(size=(1024, 1024)).astype("float16")
     b_np = np.random.uniform(size=(1024, 1024)).astype("float16")
     c_np = np.dot(a_np.astype("float32"), b_np.T.astype("float32"))
-    a = tvm.nd.array(a_np, dev)
-    b = tvm.nd.array(b_np, dev)
-    c = tvm.nd.array(np.zeros((1024, 1024), dtype="float32"), dev)
-    f = tvm.build(tensorcore_gemm, target="cuda", name="dense")
-    f(a, b, c)
-    tvm.testing.assert_allclose(c.numpy(), c_np, rtol=1e-3)
+    buff_a = tvm.nd.array(a_np, dev)
+    buff_b = tvm.nd.array(b_np, dev)
+    buff_c = tvm.nd.array(np.zeros((1024, 1024), dtype="float32"), dev)
+    myfunc = tvm.build(tensorcore_gemm, target="cuda", name="dense")
+    myfunc(buff_a, buff_b, buff_c)
+    tvm.testing.assert_allclose(buff_c.numpy(), c_np, rtol=1e-3)
 
-    evaluator = f.time_evaluator(f.entry_name, dev, number=100)
-    t = evaluator(a, b, c).mean
+    evaluator = myfunc.time_evaluator(myfunc.entry_name, dev, number=100)
+    time_elapsed = evaluator(buff_a, buff_b, buff_c).mean
     num_flops = 2 * 1024 * 1024 * 1024
-    gflops = num_flops / (t * 1e3) / 1e6
-    print("gemm with tensor core: %f ms" % (t * 1e3))
+    gflops = num_flops / (time_elapsed * 1e3) / 1e6
+    print("gemm with tensor core: %f ms" % (time_elapsed * 1e3))
     print("GFLOPS: %f" % gflops)
 
 

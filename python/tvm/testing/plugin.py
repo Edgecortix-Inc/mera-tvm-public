@@ -37,6 +37,13 @@ import _pytest
 import tvm
 from tvm.testing import utils
 
+try:
+    from xdist.scheduler.loadscope import LoadScopeScheduling
+
+    HAVE_XDIST = True
+except ImportError:
+    HAVE_XDIST = False
+
 
 MARKERS = {
     "gpu": "mark a test as requiring a gpu",
@@ -48,14 +55,16 @@ MARKERS = {
     "metal": "mark a test as requiring metal",
     "llvm": "mark a test as requiring llvm",
     "ethosn": "mark a test as requiring ethosn",
+    "hexagon": "mark a test as requiring hexagon",
+    "corstone300": "mark a test as requiring Corstone300 FVP",
 }
 
 
 def pytest_configure(config):
     """Runs at pytest configure time, defines marks to be used later."""
 
-    for markername, desc in MARKERS.items():
-        config.addinivalue_line("markers", "{}: {}".format(markername, desc))
+    for feature in utils.Feature._all_features.values():
+        feature._register_marker(config)
 
     print("enabled targets:", "; ".join(map(lambda x: x[0], utils.enabled_targets())))
     print("pytest marker:", config.option.markexpr)
@@ -73,6 +82,7 @@ def pytest_collection_modifyitems(config, items):
     # pylint: disable=unused-argument
     _count_num_fixture_uses(items)
     _remove_global_fixture_definitions(items)
+    _sort_tests(items)
 
 
 @pytest.fixture
@@ -235,29 +245,57 @@ def _remove_global_fixture_definitions(items):
                 delattr(module, name)
 
 
+def _sort_tests(items):
+    """Sort tests by file/function.
+
+    By default, pytest will sort tests to maximize the re-use of
+    fixtures.  However, this assumes that all fixtures have an equal
+    cost to generate, and no caches outside of those managed by
+    pytest.  A tvm.testing.parameter is effectively free, while
+    reference data for testing may be quite large.  Since most of the
+    TVM fixtures are specific to a python function, sort the test
+    ordering by python function, so that
+    tvm.testing.utils._fixture_cache can be cleared sooner rather than
+    later.
+
+    Should be called from pytest_collection_modifyitems.
+
+    """
+
+    def sort_key(item):
+        filename, lineno, test_name = item.location
+        test_name = test_name.split("[")[0]
+        return filename, lineno, test_name
+
+    items.sort(key=sort_key)
+
+
 def _target_to_requirement(target):
     if isinstance(target, str):
         target = tvm.target.Target(target)
 
     # mapping from target to decorator
     if target.kind.name == "cuda" and "cudnn" in target.attrs.get("libs", []):
-        return utils.requires_cudnn()
+        return utils.requires_cudnn.marks()
     if target.kind.name == "cuda" and "cublas" in target.attrs.get("libs", []):
-        return utils.requires_cublas()
+        return utils.requires_cublas.marks()
     if target.kind.name == "cuda":
-        return utils.requires_cuda()
+        return utils.requires_cuda.marks()
     if target.kind.name == "rocm":
-        return utils.requires_rocm()
+        return utils.requires_rocm.marks()
     if target.kind.name == "vulkan":
-        return utils.requires_vulkan()
+        return utils.requires_vulkan.marks()
     if target.kind.name == "nvptx":
-        return utils.requires_nvptx()
+        return utils.requires_nvptx.marks()
     if target.kind.name == "metal":
-        return utils.requires_metal()
+        return utils.requires_metal.marks()
     if target.kind.name == "opencl":
-        return utils.requires_opencl()
+        return utils.requires_opencl.marks()
     if target.kind.name == "llvm":
-        return utils.requires_llvm()
+        return utils.requires_llvm.marks()
+    if target.kind.name == "hexagon":
+        return utils.requires_hexagon.marks()
+
     return []
 
 
@@ -288,3 +326,38 @@ def _parametrize_correlated_parameters(metafunc):
             names = ",".join(name for name, values in params)
             value_sets = zip(*[values for name, values in params])
             metafunc.parametrize(names, value_sets, indirect=True, ids=ids)
+
+
+# pytest-xdist isn't required but is used in CI, so guard on its presence
+if HAVE_XDIST:
+
+    def pytest_xdist_make_scheduler(config, log):
+        """
+        Serialize certain tests for pytest-xdist that have inter-test
+        dependencies
+        """
+
+        class TvmTestScheduler(LoadScopeScheduling):
+            """
+            Scheduler to serializer tests
+            """
+
+            def _split_scope(self, nodeid):
+                """
+                Returns a specific string for classes of nodeids
+                """
+                # NOTE: these tests contain inter-test dependencies and must be
+                # serialized
+                items = {
+                    "test_tvm_testing_features": "functional-tests",
+                    "tests/python/unittest/test_crt": "crt-tests",
+                    "tests/python/driver/tvmc": "tvmc-tests",
+                }
+
+                for nodeid_pattern, suite_name in items.items():
+                    if nodeid_pattern in nodeid:
+                        return suite_name
+
+                return nodeid
+
+        return TvmTestScheduler(config, log)

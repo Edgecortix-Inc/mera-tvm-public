@@ -24,6 +24,7 @@
 #include <dmlc/thread_local.h>
 #include <tvm/ir/transform.h>
 #include <tvm/node/repr_printer.h>
+#include <tvm/node/structural_hash.h>
 #include <tvm/runtime/device_api.h>
 #include <tvm/runtime/registry.h>
 
@@ -40,6 +41,8 @@ namespace transform {
 using tvm::ReprPrinter;
 using tvm::runtime::TVMArgs;
 using tvm::runtime::TVMRetValue;
+
+TVM_REGISTER_PASS_CONFIG_OPTION("testing.immutable_module", Bool);
 
 struct PassContextThreadLocalEntry {
   /*! \brief The default pass context. */
@@ -264,8 +267,28 @@ IRModule Pass::operator()(IRModule mod, const PassContext& pass_ctx) const {
                << " with opt level: " << pass_info->opt_level;
     return mod;
   }
-  auto ret = node->operator()(std::move(mod), pass_ctx);
+  IRModule ret;
+  if (pass_ctx->GetConfig<Bool>("testing.immutable_module", Bool(false)).value()) {
+    ret = Pass::AssertImmutableModule(mod, node, pass_ctx);
+  } else {
+    ret = node->operator()(std::move(mod), pass_ctx);
+  }
   pass_ctx.InstrumentAfterPass(ret, pass_info);
+  return std::move(ret);
+}
+
+IRModule Pass::AssertImmutableModule(const IRModule& mod, const PassNode* node,
+                                     const PassContext& pass_ctx) {
+  size_t before_pass_hash = tvm::StructuralHash()(mod);
+  ObjectPtr<Object> module_ptr = ObjectRef::GetDataPtr<Object>(mod);
+  IRModule copy_mod = IRModule(module_ptr);
+  IRModule ret = node->operator()(mod, pass_ctx);
+  size_t after_pass_hash = tvm::StructuralHash()(copy_mod);
+  if (before_pass_hash != after_pass_hash) {
+    // The chance of getting a hash conflict between a module and the same module but mutated
+    // must be very low.
+    LOG_FATAL << "Immutable module has been modified in pass: " << node->Info()->name;
+  }
   return std::move(ret);
 }
 
@@ -318,63 +341,6 @@ class ModulePass : public Pass {
   TVM_DEFINE_OBJECT_REF_METHODS(ModulePass, Pass, ModulePassNode);
 };
 
-/*!
- * \brief The SequentialNode contains a set of passes that transform Relay
- * programs from one AST to another semantically equivalent one.
- *
- * One example of this level of pass is that the pass manager needs to correctly
- * perform a host of optimizations with a given optimization level and disabled
- * passes.
- */
-class SequentialNode : public PassNode {
- public:
-  /* \brief The pass meta data.*/
-  PassInfo pass_info;
-
-  /*! \brief A list of passes that used to compose a sequential pass. */
-  tvm::Array<Pass> passes;
-
-  void VisitAttrs(tvm::AttrVisitor* v) {
-    v->Visit("pass_info", &pass_info);
-    v->Visit("passes", &passes);
-  }
-
-  /*!
-   * \brief Get the pass information/meta data.
-   */
-  PassInfo Info() const override { return pass_info; }
-
-  /*!
-   * \brief Resolve the pass dependency. It globs all required passes by
-   *        a given pass and executes them.
-   *
-   * \param mod The module that an optimization pass runs on.
-   *
-   * \return The updated module after resolving pass dependencies.
-   *
-   * TODO(zhiics) Build a dependency graph among the passes using provided
-   * metadata, i.e. required_passes. Likely, we can have a data structure, i.e.
-   * PassInfo, to store the relevant information including the parent passes.
-   */
-  void ResolveDependency(const IRModule& mod);
-
-  /*!
-   * \brief Perform optimizations on a series of passes. The aforementioned
-   *        typical pass manager jobs could be done by it. This function could
-   *        be overloaded to focus on different metrics, i.e. performance,
-   *        memory footprint, etc.
-   *
-   * \param mod The module that these passes are applied on.
-   * \param pass_ctx The context that these passes execute on.
-   *
-   * \return Return the updated module.
-   */
-  IRModule operator()(IRModule mod, const PassContext& pass_ctx) const final;
-
-  static constexpr const char* _type_key = "transform.Sequential";
-  TVM_DECLARE_FINAL_OBJECT_INFO(SequentialNode, PassNode);
-};
-
 PassInfo::PassInfo(int opt_level, String name, tvm::Array<runtime::String> required) {
   auto pass_info = make_object<PassInfoNode>();
   pass_info->opt_level = opt_level;
@@ -409,8 +375,9 @@ IRModule ModulePassNode::operator()(IRModule mod, const PassContext& pass_ctx) c
   const PassInfo& pass_info = Info();
   ICHECK(mod.defined()) << "The input module must be set.";
 
-  DLOG(INFO) << "Executing module pass : " << pass_info->name
-             << " with opt level: " << pass_info->opt_level;
+  VLOG_CONTEXT << pass_info->name;
+  VLOG(0) << "Executing module pass with opt level: " << pass_info->opt_level;
+  VLOG(1) << "Input module:" << std::endl << PrettyPrint(mod);
 
   mod = pass_func(std::move(mod), pass_ctx);
 
@@ -421,6 +388,8 @@ IRModule ModulePassNode::operator()(IRModule mod, const PassContext& pass_ctx) c
 
   pass_ctx->diag_ctx.value().Render();
   pass_ctx->diag_ctx = previous;
+
+  VLOG(1) << "Result module:" << std::endl << PrettyPrint(mod);
 
   return mod;
 }
@@ -462,7 +431,7 @@ Pass GetPass(const String& pass_name) {
     // pass
   } else if ((f = Registry::Get("relay._transform." + pass_name))) {
   }
-  ICHECK(f != nullptr) << "Cannot use " << pass_name << "to create the pass";
+  ICHECK(f != nullptr) << "Cannot use " << pass_name << " to create the pass";
   return (*f)();
 }
 
@@ -473,7 +442,10 @@ IRModule SequentialNode::operator()(IRModule mod, const PassContext& pass_ctx) c
   for (const Pass& pass : passes) {
     ICHECK(pass.defined()) << "Found undefined pass for optimization.";
     const PassInfo& pass_info = pass->Info();
-    if (!pass_ctx.PassEnabled(pass_info)) continue;
+    if (!pass_ctx.PassEnabled(pass_info)) {
+      VLOG(0) << "skipping disabled pass '" << pass_info->name << "'";
+      continue;
+    }
     // resolve dependencies
     for (const auto& it : pass_info->required) {
       mod = GetPass(it)(std::move(mod), pass_ctx);
@@ -504,15 +476,19 @@ TVM_REGISTER_GLOBAL("transform.Info").set_body([](TVMArgs args, TVMRetValue* ret
 TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
     .set_dispatch<PassInfoNode>([](const ObjectRef& ref, tvm::ReprPrinter* p) {
       auto* node = static_cast<const PassInfoNode*>(ref.get());
-      p->stream << "The meta data of the pass: ";
+      p->stream << "The meta data of the pass - ";
       p->stream << "pass name: " << node->name;
-      p->stream << "opt_level: " << node->opt_level;
-      p->stream << "required passes: ["
-                << "\n";
-      for (const auto& it : node->required) {
-        p->stream << it << ", ";
+      p->stream << ", opt_level: " << node->opt_level;
+      if (node->required.empty()) {
+        p->stream << ", required passes: []\n";
+      } else {
+        p->stream << ", required passes: ["
+                  << "\n";
+        for (const auto& it : node->required) {
+          p->stream << it << ", ";
+        }
+        p->stream << "]\n";
       }
-      p->stream << "]\n";
     });
 
 TVM_REGISTER_NODE_TYPE(ModulePassNode);

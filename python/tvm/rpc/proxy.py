@@ -379,7 +379,7 @@ class ProxyServerHandler(object):
 
             if need_update_info:
                 keylist = "[" + ",".join(self._key_set) + "]"
-                cinfo = {"key": "server:proxy" + keylist}
+                cinfo = {"key": "server:proxy" + keylist, "addr": [None, self._listen_port]}
                 base.sendjson(self._tracker_conn, [TrackerCode.UPDATE_INFO, cinfo])
                 assert base.recvjson(self._tracker_conn) == TrackerCode.SUCCESS
             self._tracker_pending_puts = []
@@ -568,7 +568,7 @@ def _popen_start_proxy_server(
 
 
 class Proxy(object):
-    """Start RPC proxy server on a seperate process.
+    """Start RPC proxy server on a separate process.
 
     Python implementation based on PopenWorker.
 

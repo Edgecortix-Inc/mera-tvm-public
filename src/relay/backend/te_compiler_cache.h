@@ -24,6 +24,7 @@
 #ifndef TVM_RELAY_BACKEND_TE_COMPILER_CACHE_H_
 #define TVM_RELAY_BACKEND_TE_COMPILER_CACHE_H_
 
+#include <tvm/ir/name_supply.h>
 #include <tvm/node/structural_equal.h>
 #include <tvm/node/structural_hash.h>
 #include <tvm/relay/analysis.h>
@@ -36,7 +37,9 @@
 
 #include <functional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
+#include <utility>
 
 #include "../transforms/infer_layout_utils.h"
 
@@ -62,7 +65,6 @@ struct LoweredOutputNode : public Object {
     v->Visit("outputs", &outputs);
     v->Visit("implementation", &implementation);
   }
-
   static constexpr const char* _type_key = "relay.LoweredOutput";
   TVM_DECLARE_FINAL_OBJECT_INFO(LoweredOutputNode, Object);
 };
@@ -82,10 +84,13 @@ class CCacheKeyNode : public Object {
   Function source_func;
   /*! \brief The hardware target.*/
   Target target;
+  /*! \brief The virtual device constrains.*/
+  VirtualDevice virtual_device;
 
   void VisitAttrs(tvm::AttrVisitor* v) {
     v->Visit("source_func", &source_func);
     v->Visit("target", &target);
+    v->Visit("virtual_device", &virtual_device);
   }
   /*! \return The hash value of CCacheKey. */
   inline size_t Hash() const;
@@ -117,7 +122,8 @@ class CCacheKey : public ObjectRef {
    * \param source_func The source function.
    * \param target The target device.
    */
-  TVM_DLL CCacheKey(Function source_func, Target target);
+  TVM_DLL CCacheKey(Function source_func, Target target,
+                    VirtualDevice virtual_device = VirtualDevice::FullyUnconstrained());
 
   const CCacheKeyNode* operator->() const { return static_cast<const CCacheKeyNode*>(get()); }
   // comparator
@@ -130,20 +136,23 @@ class CCacheKey : public ObjectRef {
 
 /*! \brief Node container to represent a cached function. */
 struct CachedFuncNode : public Object {
-  /* \brief compiled target */
+  /*! \brief compiled target */
   tvm::Target target;
   /*! \brief Primitive Function Name */
   GlobalVar prim_fn_var;
-  /* \brief The inputs to the function */
+  /*! \brief The inputs to the function */
   tvm::Array<te::Tensor> inputs;
-  /* \brief The outputs to the function */
+  /*! \brief The outputs to the function */
   tvm::Array<te::Tensor> outputs;
   /*! \brief The schedule to the function */
   te::Schedule schedule;
+  /*! \brief The TIR function if lowering in the meta schedule path */
+  Optional<tir::PrimFunc> prim_func;
   /*! \brief Parameter usage states in the shape function. */
   tvm::Array<Integer> shape_func_param_states;
   /*! \brief The lowered functions to support the function. */
   IRModule funcs = IRModule(Map<GlobalVar, BaseFunc>({}));
+  std::unordered_map<const ConstantNode*, te::Tensor> constant_tensors;
 
   void VisitAttrs(tvm::AttrVisitor* v) {
     v->Visit("target", &target);
@@ -151,6 +160,7 @@ struct CachedFuncNode : public Object {
     v->Visit("inputs", &inputs);
     v->Visit("outputs", &outputs);
     v->Visit("schedule", &schedule);
+    v->Visit("prim_func", &prim_func);
     v->Visit("funcs", &funcs);
     v->Visit("shape_func_param_states", &shape_func_param_states);
   }
@@ -162,9 +172,10 @@ struct CachedFuncNode : public Object {
 class CachedFunc : public ObjectRef {
  public:
   CachedFunc(tvm::Target target, GlobalVar prim_fn_name, tvm::Array<te::Tensor> inputs,
-             tvm::Array<te::Tensor> outputs, te::Schedule schedule,
+             tvm::Array<te::Tensor> outputs, te::Schedule schedule, tir::PrimFunc prim_func,
              tvm::Array<Integer> shape_func_param_states,
-             IRModule funcs = IRModule(Map<GlobalVar, BaseFunc>({})));
+             IRModule funcs = IRModule(Map<GlobalVar, BaseFunc>({})),
+             std::unordered_map<const ConstantNode*, te::Tensor> constant_tensors = {});
 
  public:
   TVM_DEFINE_OBJECT_REF_METHODS(CachedFunc, ObjectRef, CachedFuncNode);
@@ -201,6 +212,16 @@ class CCacheValue : public ObjectRef {
 Array<IndexExpr> GetShape(const Array<IndexExpr>& shape);
 
 /*!
+ * \brief Lowers Relay primitive Function to TE Compute
+ * \param source_func The primitive function to be lowered.
+ * \param target The target we want to create schedule for.
+ * \param return_inputs If true, prepend input tensors to the output array of tensors.
+ * \return Tuple of the lowered TE compute, constant raw data, and fused function name.
+ */
+std::tuple<Array<te::Tensor>, Array<runtime::NDArray>, std::string> LowerTECompute(
+    const Function& source_func, Target target, bool return_inputs = true);
+
+/*!
  * \brief Create schedule for target.
  * \param source_func The primitive function to be lowered.
  * \param target The target we want to create schedule for.
@@ -208,13 +229,10 @@ Array<IndexExpr> GetShape(const Array<IndexExpr>& shape);
  *  The funcs field in cache is not yet populated.
  */
 CachedFunc PrimFuncFor(const Function& source_func, const Target& target,
-                       std::function<std::string(std::string)> renamer);
+                       GlobalVarSupply global_var_supply);
 
 CachedFunc ShapeFuncFor(const Function& prim_func, const Target& target,
-                        std::function<std::string(std::string)> renamer);
-
-// TODO(mbs): Bring name uniqification under control -- this is replicated in quite a few places.
-std::string GetUniqueName(std::string name, std::unordered_map<std::string, int>* name_map);
+                        GlobalVarSupply global_var_supply);
 
 // implementations
 inline size_t CCacheKeyNode::Hash() const {
@@ -229,6 +247,7 @@ inline size_t CCacheKeyNode::Hash() const {
 inline bool CCacheKeyNode::Equal(const CCacheKeyNode* other) const {
   if (Hash() != other->Hash()) return false;
   return this->target->str() == other->target->str() &&
+         this->virtual_device == other->virtual_device &&
          tvm::StructuralEqual()(this->source_func, other->source_func);
 }
 

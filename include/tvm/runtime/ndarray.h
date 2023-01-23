@@ -38,9 +38,19 @@
 #include <vector>
 
 namespace tvm {
-namespace runtime {
 
-typedef DLDevice Device;
+// alias DLDevice
+using Device = DLDevice;
+
+// A 'null' device type, does not correspond to any DLDeviceType enum.
+// TODO(mbs): This is to help us as we transition away from representing the 'homogenous' case
+// as a singleton target map indexed by the invalid DLDeviceType '0'.
+constexpr DLDeviceType kNullDeviceType = static_cast<DLDeviceType>(0);
+
+// An 'invalid' device type, does not correspond to any DLDeviceType enum.
+constexpr DLDeviceType kInvalidDeviceType = static_cast<DLDeviceType>(-1);
+
+namespace runtime {
 
 /*!
  * \brief Managed NDArray.
@@ -146,6 +156,25 @@ class NDArray : public ObjectRef {
   TVM_DLL static NDArray Empty(ShapeTuple shape, DLDataType dtype, Device dev,
                                Optional<String> mem_scope = NullOpt);
   /*!
+   * \brief Create a NDArray backed by an external DLTensor without memory copying.
+   *
+   * If DLTensor is not contiguous or has bad aligned data, It fails.
+   * This allows us to create a NDArray using the memory
+   * allocated by an external source. Responsibility for memory
+   * retaining lies with the external source.
+   * \param dl_tensor The DLTensor for NDArray base.
+   * \return The created NDArray view.
+   */
+  TVM_DLL static NDArray FromExternalDLTensor(const DLTensor& dl_tensor);
+  /*!
+   * \brief Create new NDArray, data is copied from DLTensor.
+   *
+   * \param dl_tensor The DLTensor to copy from.
+   * \param dev device location of the created NDArray.
+   * \return The created NDArray view.
+   */
+  TVM_DLL static NDArray NewFromDLTensor(DLTensor* dl_tensor, const Device& dev);
+  /*!
    * \brief Create a NDArray backed by a dlpack tensor.
    *
    * This allows us to create a NDArray using the memory
@@ -168,8 +197,22 @@ class NDArray : public ObjectRef {
 
   TVM_DLL ShapeTuple Shape() const;
   TVM_DLL runtime::DataType DataType() const;
+  /*!
+   * \brief Check conditions for construction NDArray over DLTensor without copying.
+   * There are three conditions to check:
+   * 1. Destination device is the same as DLTensor device
+   * 2. Destination device id is the same as DLTensor device id
+   * 3. Memory in DLTensor is aligned as expected for NDArray
+   * \param tensor the DLTensor.
+   * \param dev destination device.
+   * \return true if all conditions are satisfied.
+   */
+  TVM_DLL static bool AbilityOfZeroCopyForDLTensor(DLTensor* tensor, const Device& dev);
   // internal namespace
   struct Internal;
+
+ private:
+  TVM_DLL static bool IsAligned(const DLTensor& tensor);
 
  protected:
   friend class TVMPODValue_;
@@ -317,7 +360,7 @@ inline size_t GetDataSize(const DLTensor& arr) {
  * \param arr The input DLTensor.
  * \return The check result.
  */
-inline bool IsContiguous(const DLTensor& arr) {
+static inline bool IsContiguous(const DLTensor& arr) {
   if (arr.strides == nullptr) return true;
   int64_t expected_stride = 1;
   for (int32_t i = arr.ndim; i != 0; --i) {
@@ -481,23 +524,19 @@ inline bool NDArray::Load(dmlc::Stream* strm) {
 }
 
 }  // namespace runtime
-
-// alias Device
-using tvm::runtime::Device;
-
 }  // namespace tvm
 
 namespace std {
 template <>
-struct hash<tvm::runtime::Device> {
-  std::size_t operator()(const tvm::runtime::Device& dev) const {
+struct hash<tvm::Device> {
+  std::size_t operator()(const tvm::Device& dev) const {
     return ((dev.device_id << 8) | dev.device_type);
   }
 };
 
 template <>
-struct equal_to<tvm::runtime::Device> {
-  bool operator()(const tvm::runtime::Device& lhs, const tvm::runtime::Device& rhs) const {
+struct equal_to<tvm::Device> {
+  bool operator()(const tvm::Device& lhs, const tvm::Device& rhs) const {
     return (lhs.device_type == rhs.device_type && lhs.device_id == rhs.device_id);
   }
 };

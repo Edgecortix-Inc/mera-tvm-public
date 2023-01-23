@@ -64,6 +64,15 @@ from . import base
 from .base import RPC_TRACKER_MAGIC, TrackerCode
 
 logger = logging.getLogger("RPCTracker")
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(
+    logging.Formatter(
+        fmt="%(asctime)s.%(msecs)03d %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+)
+logger.addHandler(console_handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
 
 class Scheduler(object):
@@ -337,9 +346,10 @@ class TrackerServerHandler(object):
     def close(self, conn):
         self._connections.remove(conn)
         if "key" in conn._info:
-            key = conn._info["key"].split(":")[1]  # 'server:rasp3b' -> 'rasp3b'
             for value in conn.put_values:
-                self._scheduler_map[key].remove(value)
+                _, _, _, key = value
+                rpc_key = key.split(":")[0]
+                self._scheduler_map[rpc_key].remove(value)
 
     def stop(self):
         """Safely stop tracker."""

@@ -26,9 +26,11 @@ def test_compiler_attr():
     config = {
         "accelerator_config": "ethos-u55-32",
     }
-    with tvm.transform.PassContext(opt_level=3, config={"relay.ext.ethosu.options": config}):
-        with tvm.target.Target("c -device=micro_dev"):
-            assert util.get_accelerator_config() == config["accelerator_config"]
+    with tvm.transform.PassContext(opt_level=3, config={"relay.ext.ethos-u.options": config}):
+        with tvm.target.Target("c"):
+            compiler_attrs = tvm.get_global_func("relay.ext.ethos-u.get_compiler_attrs")()
+            accel_config_str = compiler_attrs.accelerator_config
+            assert accel_config_str == config["accelerator_config"]
 
 
 def test_compiler_attr_default():
@@ -36,8 +38,10 @@ def test_compiler_attr_default():
         "accelerator_config": "ethos-u55-256",
     }
     with tvm.transform.PassContext(opt_level=3):
-        with tvm.target.Target("c -device=micro_dev"):
-            assert util.get_accelerator_config() == default_config["accelerator_config"]
+        with tvm.target.Target("c"):
+            compiler_attrs = tvm.get_global_func("relay.ext.ethos-u.get_compiler_attrs")()
+            accel_config_str = compiler_attrs.accelerator_config
+            assert accel_config_str == default_config["accelerator_config"]
 
 
 if __name__ == "__main__":

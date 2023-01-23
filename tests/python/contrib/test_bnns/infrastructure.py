@@ -43,7 +43,7 @@ class Device:
 
     Notes
     -----
-        The test configuration will be loaded once when the the class is created. If the configuration
+        The test configuration will be loaded once when the class is created. If the configuration
         changes between tests, any changes will not be picked up.
 
 
@@ -142,8 +142,8 @@ def build_module(mod, target, params=None, enable_bnns=True, tvm_ops=0):
     with tvm.transform.PassContext(opt_level=3):
         if enable_bnns:
             mod = partition_for_bnns(mod)
-        relay.backend.compile_engine.get().clear()
-        return relay.build(mod, target=target, target_host=target, params=params)
+        relay.backend.te_compiler.get().clear()
+        return relay.build(mod, target=target, params=params)
 
 
 def build_and_run(

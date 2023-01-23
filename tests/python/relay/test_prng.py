@@ -166,7 +166,4 @@ def test_threefry_generate_out_size():
 
 
 if __name__ == "__main__":
-    test_threefry_repeatability(tvm.target.Target("llvm"), tvm.device("cpu"))
-    test_threefry_split(tvm.target.Target("llvm"), tvm.device("cpu"))
-    test_threefry_sequential_generate(tvm.target.Target("llvm"), tvm.device("cpu"))
-    test_threefry_sequential_generate_remaining(tvm.target.Target("llvm"), tvm.device("cpu"))
+    tvm.testing.main()

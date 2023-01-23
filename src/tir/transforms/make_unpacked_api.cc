@@ -57,45 +57,29 @@ PrimFunc MakeUnpackedAPI(PrimFunc&& func) {
   const Stmt nop = Evaluate(0);
   std::vector<Stmt> device_init;
 
-  // Create arg to buffer binder
-  std::unordered_map<const VarNode*, PrimExpr> vmap;
-  ArgBinder binder(&vmap);
-
   // Collect variables and buffers to map between
   Array<Var> args;
-  std::vector<std::pair<Var, Var>> var_def;
-  std::vector<std::pair<Var, Buffer>> buffer_def;
 
-  for (int i = 0; i < static_cast<int>(func_ptr->params.size()); ++i) {
-    Var param = func_ptr->params[i];
-    Var v_arg = Var("arg" + std::to_string(i), param->dtype);
-
-    auto it = func_ptr->buffer_map.find(param);
-    if (it != func_ptr->buffer_map.end()) {
-      buffer_def.emplace_back(v_arg, (*it).second);
+  for (const Var& param : func->params) {
+    // Ideally all func params should have Buffers defined in the buffer_map
+    // We should look to insert buffer_maps for all PrimFuncs that are returned
+    // to the core compiler.
+    if (func->buffer_map.find(param) != func->buffer_map.end()) {
+      args.push_back(func->buffer_map[param]->data);
     } else {
-      var_def.emplace_back(v_arg, param);
+      args.push_back(param);
     }
-
-    args.push_back(v_arg);
   }
 
-  // Bind variables then bind buffers to them to ensure correct ordering
-  for (const auto& kv : var_def) {
-    binder.Bind(kv.second, kv.first, kv.first->name_hint, true);
-  }
-  for (const auto& kv : buffer_def) {
-    binder.Bind(kv.second->data, kv.first, kv.first->name_hint, true);
-  }
-
-  if (buffer_def.size()) {
+  if (func->buffer_map.size()) {
     device_init.push_back(AttrStmt(node, attr::device_id, device_id, nop));
     device_init.push_back(AttrStmt(node, attr::device_type, device_type, nop));
   }
 
-  func_ptr->body = MergeNest({device_init, binder.init_nest(), binder.asserts()}, func_ptr->body);
+  func_ptr->body = MergeNest(device_init, func_ptr->body);
   func_ptr->params = args;
   func_ptr->ret_type = PrimType(DataType::Int(32));
+  func_ptr->buffer_map = Map<Var, Buffer>();
 
   // return the function.
   return std::move(func);

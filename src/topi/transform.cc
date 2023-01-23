@@ -54,6 +54,10 @@ TVM_REGISTER_GLOBAL("topi.reshape").set_body([](TVMArgs args, TVMRetValue* rv) {
   *rv = reshape(args[0], args[1]);
 });
 
+TVM_REGISTER_GLOBAL("topi.sliding_window").set_body([](TVMArgs args, TVMRetValue* rv) {
+  *rv = sliding_window(args[0], args[1], args[2], args[3]);
+});
+
 TVM_REGISTER_GLOBAL("topi.squeeze").set_body([](TVMArgs args, TVMRetValue* rv) {
   *rv = squeeze(args[0], ArrayOrInt(args[1]));
 });
@@ -167,10 +171,6 @@ TVM_REGISTER_GLOBAL("topi.tensordot").set_body([](TVMArgs args, TVMRetValue* rv)
     Array<PrimExpr> axes = args[3];
     *rv = tensordot(args[0], args[1], args[2], axes);
   }
-});
-
-TVM_REGISTER_GLOBAL("topi.einsum").set_body([](TVMArgs args, TVMRetValue* rv) {
-  *rv = einsum(args[0], args[1]);
 });
 
 TVM_REGISTER_GLOBAL("topi.strided_slice").set_body([](TVMArgs args, TVMRetValue* rv) {

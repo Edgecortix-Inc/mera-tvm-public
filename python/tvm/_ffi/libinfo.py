@@ -139,12 +139,12 @@ def find_lib_path(name=None, search_path=None, optional=False):
         lib_found = [p for p in runtime_dll_path if os.path.exists(p) and os.path.isfile(p)]
 
     if not lib_found:
-        message = (
-            "Cannot find the files.\n"
-            + "List of candidates:\n"
-            + str("\n".join(lib_dll_path + runtime_dll_path))
-        )
         if not optional:
+            message = (
+                f"Cannot find libraries: {name}\n"
+                + "List of candidates:\n"
+                + "\n".join(lib_dll_path + runtime_dll_path)
+            )
             raise RuntimeError(message)
         return None
 

@@ -48,8 +48,8 @@ using JSONGraphNodeEntry = tvm::runtime::json::JSONGraphNodeEntry;
  * perform inference.
  */
 struct TensorRTEngineAndContext {
-  nvinfer1::ICudaEngine* engine;
-  nvinfer1::IExecutionContext* context;
+  nvinfer1::ICudaEngine* engine = nullptr;
+  nvinfer1::IExecutionContext* context = nullptr;
   std::vector<std::string> inputs;
   std::vector<std::string> outputs;
 };
@@ -68,12 +68,12 @@ class TensorRTBuilder {
    * \param logger TensorRT logger to use for errors and warnings.
    * \param max_workspace_size Workspace size parameter for TensorRT engine build phase.
    * \param use_implicit_batch Whether to use implicit batch mode (default)
-   * \param use_fp16 Whether to use implicit batch mode (default)
+   * \param use_fp16 Whether to automatically convert a model to fp16
    * \param batch_size If use_implicit_batch,
    */
   TensorRTBuilder(TensorRTLogger* logger, const std::vector<const DLTensor*>& data_entry,
-                  size_t max_workspace_size, bool use_implicit_batch, bool use_fp16,
-                  int batch_size);
+                  size_t max_workspace_size, bool use_implicit_batch, bool use_fp16, int batch_size,
+                  nvinfer1::IInt8Calibrator* calibrator = nullptr);
 
   /*!
    * \brief Add TensorRT input(s) for input node in network definition.
@@ -125,15 +125,15 @@ class TensorRTBuilder {
   std::unordered_map<int, std::vector<TensorRTOpInput>> node_output_map_;
 
   /*! \brief TensorRT builder. */
-  nvinfer1::IBuilder* builder_;
+  nvinfer1::IBuilder* builder_ = nullptr;
 
 #if TRT_VERSION_GE(6, 0, 1)
   /*! \brief TensorRT builder config. */
-  nvinfer1::IBuilderConfig* config_;
+  nvinfer1::IBuilderConfig* config_ = nullptr;
 #endif
 
   /*! \brief TensorRT network definition. */
-  nvinfer1::INetworkDefinition* network_;
+  nvinfer1::INetworkDefinition* network_ = nullptr;
 
   /*! \brief List of all weights held in memory. */
   std::vector<nvinfer1::Weights> trt_weights_;
@@ -153,6 +153,9 @@ class TensorRTBuilder {
   /*! \brief Whether to automatically convert model to 16-bit floating point precision. */
   bool use_fp16_;
 
+  /*! \brief whether to automatically convert model to int8 precision */
+  bool use_int8_;
+
   /*! \brief Batch size to optimize for. */
   int batch_size_;
 
@@ -161,6 +164,10 @@ class TensorRTBuilder {
 
   /*! \brief Output names. */
   std::vector<std::string> network_output_names_;
+
+  /*! \brief calibrator pointer to add batch data when using int8 mode */
+  /*! \brief pointer will be nullptr when it is fp16 or fp32 precision */
+  nvinfer1::IInt8Calibrator* calibrator_;
 };
 
 }  // namespace contrib

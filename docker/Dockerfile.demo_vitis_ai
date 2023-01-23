@@ -15,8 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# CI docker VAI env
-FROM xilinx/vitis-ai:latest
+# Main Vitis AI docker env
+FROM xilinx/vitis-ai:1.4.916
+
+COPY utils/apt-install-and-clear.sh /usr/local/bin/apt-install-and-clear
 
 RUN apt-get update --fix-missing
 

@@ -16,8 +16,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-#include "./utils.h"
+#include <tvm/arith/int_set.h>
 
+#include "./utils.h"
 namespace tvm {
 namespace tir {
 
@@ -44,13 +45,10 @@ Array<arith::IntSet> AnalyzeRegionUpperBound(const BufferRegion& region,        
       /*low_inclusive=*/dom_low_inclusive,
       /*high_exclusive=*/dom_high_exclusive,
       /*extra_relax_scope=*/runtime::StorageScope::Create(region->buffer.scope()));
-  if (Optional<Array<arith::IntSet>> result = EstimateRegionLowerBound(
-          /*region=*/region->region,
-          /*var_dom=*/var_dom,
-          /*predicate=*/predicate, /*analyzer=*/analyzer)) {
-    return result.value();
-  }
-  return arith::EvalSet(region->region, AsIntSet(var_dom));
+  return EstimateRegionUpperBound(
+      /*region=*/region->region,
+      /*var_dom=*/var_dom,
+      /*predicate=*/predicate, /*analyzer=*/analyzer);
 }
 
 /*!
@@ -101,13 +99,22 @@ bool ProducerCoversConsumer(const Array<PrimExpr>& buffer_shape,
     if (produced_region[i].IsNothing()) {
       return false;
     }
-    arith::IntSet produced = arith::Intersect({produced_region[i], buffer_size});
-    arith::IntSet consumed = arith::Intersect({consumed_region[i], buffer_size});
-    PrimExpr produced_min = analyzer->Simplify(produced.min());
-    PrimExpr produced_max = analyzer->Simplify(produced.max() - produced_min + 1);
-    PrimExpr consumed_min = analyzer->Simplify(consumed.min());
-    PrimExpr consumed_max = analyzer->Simplify(consumed.max() - consumed_min + 1);
-    if (!analyzer->CanProve((produced_min <= consumed_min) && (consumed_max <= produced_max))) {
+    arith::IntSet produced =
+        arith::IntSet::Interval(analyzer->canonical_simplify(produced_region[i].min()),
+                                analyzer->canonical_simplify(produced_region[i].max()));
+    arith::IntSet consumed =
+        arith::IntSet::Interval(analyzer->canonical_simplify(consumed_region[i].min()),
+                                analyzer->canonical_simplify(consumed_region[i].max()));
+    produced = arith::Intersect({produced, buffer_size});
+    consumed = arith::Intersect({consumed, buffer_size});
+
+    produced = arith::IntSet::Interval(analyzer->Simplify(produced.min()),
+                                       analyzer->Simplify(produced.max()));
+    consumed = arith::IntSet::Interval(analyzer->Simplify(consumed.min()),
+                                       analyzer->Simplify(consumed.max()));
+
+    if (!analyzer->CanProve((analyzer->canonical_simplify(produced.min() - consumed.min()) <= 0) &&
+                            (analyzer->canonical_simplify(consumed.max() - produced.max()) <= 0))) {
       return false;
     }
   }
@@ -169,34 +176,16 @@ void UpdateSRef(ScheduleStateNode* self, StmtSRefNode* sref, const StmtNode* new
 }
 
 /**************** Creation ****************/
-
-/*! \brief A helper class to create a new ScheduleStateNode from an IRModule */
-class StateCreator : private StmtVisitor {
+/*! \brief A helper class to update BlockInfo for a ScheduleStateNode */
+class BlockInfoCollector : private StmtVisitor {
  public:
-  /*!
-   * \brief The entry function
-   * \param self The schedule state to be completed
-   */
-  static ObjectPtr<ScheduleStateNode> Create(IRModule mod, int debug_mask) {
-    ObjectPtr<ScheduleStateNode> n = make_object<ScheduleStateNode>();
-    ScheduleStateNode* self = n.get();
-    // Set `n->mod`
-    n->mod = std::move(mod);
-    // Set `n->debug_mask`
-    n->debug_mask = debug_mask;
-    // Set `n->stmt2ref` and `n->block_info`
-    StateCreator creator(self);
-    for (const auto& kv : n->mod->functions) {
-      const BaseFunc& base_func = kv.second;
-      if (const auto* func = base_func.as<PrimFuncNode>()) {
-        creator.VisitStmt(func->body);
-      }
-    }
-    return n;
+  static void Collect(ScheduleStateNode* self, const Stmt& stmt) {
+    BlockInfoCollector collector(self);
+    collector.VisitStmt(stmt);
   }
 
  private:
-  explicit StateCreator(ScheduleStateNode* self)
+  explicit BlockInfoCollector(ScheduleStateNode* self)
       : self_(self), srefs_{}, block2realize_{}, block_frames_{} {
     block_frames_.emplace({});
   }
@@ -206,25 +195,11 @@ class StateCreator : private StmtVisitor {
    * \param stmt A for-loop statement or a block statement
    * \return A sref to the stmt
    */
-  StmtSRef PushSRef(const StmtNode* stmt) {
-    if (srefs_.empty()) {
-      srefs_.push_back(
-          StmtSRef(stmt,
-                   /*parent=*/nullptr,
-                   /*seq_index=*/-1));  // `seq_index` will be set properly in SetSeqIndex
-    } else {
-      StmtSRefNode* parent = srefs_.back().get();
-      srefs_.push_back(
-          StmtSRef(stmt, parent,
-                   /*seq_index=*/-1));  // `seq_index` will be set properly in SetSeqIndex
-    }
-    return srefs_.back();
-  }
+  void PushSRef(const StmtNode* stmt) { srefs_.push_back(self_->stmt2ref.at(stmt)); }
 
-  /*! \brief Pop the top of the scope and record it in stmt2ref map */
-  StmtSRef PopAndRecordSRef() {
-    StmtSRef sref = std::move(srefs_.back());
-    self_->stmt2ref[sref->stmt] = sref;
+  /*! \brief Pop the top of the scope */
+  StmtSRef PopSRef() {
+    StmtSRef sref = srefs_.back();
     srefs_.pop_back();
     return sref;
   }
@@ -233,12 +208,13 @@ class StateCreator : private StmtVisitor {
     bool is_root_block = srefs_.empty();
     // Calculate `BlockInfo::scope`
     Array<StmtSRef> child_block_srefs = std::move(block_frames_.back());
-    BlockInfo& info =
-        self_->block_info.emplace(scope_root, BlockInfo(BlockScope(child_block_srefs)))
-            .first->second;
+    BlockInfo& info = self_->block_info[scope_root] = BlockInfo(BlockScope(child_block_srefs));
     // Set `affine_binding`
     if (is_root_block) {
-      info.affine_binding = true;
+      // If the block doesn't have outer loops and BlockRealize,
+      // then we set the affine binding flag as true only if the block has no block vars
+      const BlockNode* block = TVM_SREF_TO_BLOCK(scope_root);
+      if (block->iter_vars.empty()) info.affine_binding = true;
     } else {
       info.affine_binding =
           IsAffineBinding(/*realize=*/block2realize_.at(scope_root->stmt),
@@ -262,7 +238,7 @@ class StateCreator : private StmtVisitor {
     block_reads_unbound.reserve(child_block_srefs.size());
     block_writes_unbound.reserve(child_block_srefs.size());
     for (const StmtSRef& block_sref : child_block_srefs) {
-      const BlockNode* block = TVM_SREF_TO_BLOCK(block, block_sref);
+      const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
       Map<Var, PrimExpr> binding = GetBindings(block2realize_.at(block));
       // Step 1.1. Unbind read regions
       Array<BufferRegion> reads;
@@ -283,7 +259,7 @@ class StateCreator : private StmtVisitor {
     for (const auto& kv : info.scope->dst2deps) {
       const StmtSRef& consumer_block_sref = kv.first;
       const Array<Dependency>& deps = kv.second;
-      const BlockNode* consumer_block = TVM_SREF_TO_BLOCK(consumer_block, consumer_block_sref);
+      const BlockNode* consumer_block = TVM_SREF_TO_BLOCK(consumer_block_sref);
       const BlockRealize& consumer_realize = block2realize_.at(consumer_block);
       bool& region_cover = self_->block_info.at(consumer_block_sref).region_cover = true;
       // Step 2.1. Extract the path to the scope root
@@ -370,6 +346,7 @@ class StateCreator : private StmtVisitor {
               if (!ProducerCoversConsumer(buffer->shape, produced_region, consumed_region,
                                           &analyzer_)) {
                 region_cover = false;
+                self_->block_info.at(consumer_block_sref).region_cover = region_cover;
                 break;
               }
             }
@@ -385,7 +362,7 @@ class StateCreator : private StmtVisitor {
     analyzer_.Bind(loop->loop_var, Range::FromMinExtent(loop->min, loop->extent));
     PushSRef(loop);
     VisitStmt(loop->body);
-    PopAndRecordSRef();
+    PopSRef();
   }
 
   void VisitStmt_(const BlockRealizeNode* realize) final {
@@ -395,7 +372,7 @@ class StateCreator : private StmtVisitor {
     // Recursive visit
     PushSRef(block);
     VisitStmt(block->body);  // `block->init` is not visited
-    StmtSRef sref = PopAndRecordSRef();
+    StmtSRef sref = PopSRef();
     // Create BlockInfo for the block
     MakeBlockInfo(sref);
     // Update parent scope
@@ -409,7 +386,7 @@ class StateCreator : private StmtVisitor {
     SetSeqIndexInChildren(self_, seq_stmt);
   }
 
-  /*! \brief The result ScheduleStateNode */
+  /*! \brief The ScheduleStateNode we are operating on */
   ScheduleStateNode* self_;
   /*! \brief The stack frame used to indicate the current scope */
   std::vector<StmtSRef> srefs_;
@@ -419,6 +396,87 @@ class StateCreator : private StmtVisitor {
   std::vector<Array<StmtSRef>> block_frames_;
   /*! \brief The auxiliary analyzer */
   arith::Analyzer analyzer_;
+};
+
+/*! \brief A helper class to create a new ScheduleStateNode from an IRModule */
+class StateCreator : private StmtVisitor {
+ public:
+  /*!
+   * \brief The entry function
+   * \param self The schedule state to be completed
+   */
+  static ObjectPtr<ScheduleStateNode> Create(IRModule mod, int debug_mask) {
+    ObjectPtr<ScheduleStateNode> n = make_object<ScheduleStateNode>();
+    ScheduleStateNode* self = n.get();
+    // Set `n->mod`
+    n->mod = std::move(mod);
+    // Set `n->debug_mask`
+    n->debug_mask = debug_mask;
+    // Set `n->stmt2ref` and `n->block_info`
+    StateCreator creator(self);
+    for (const auto& kv : n->mod->functions) {
+      const BaseFunc& base_func = kv.second;
+      if (const auto* func = base_func.as<PrimFuncNode>()) {
+        VerifyWellFormed(GetRef<PrimFunc>(func));
+        creator.VisitStmt(func->body);
+        BlockInfoCollector::Collect(self, func->body);
+      }
+    }
+    return n;
+  }
+
+ private:
+  explicit StateCreator(ScheduleStateNode* self) : self_(self) {}
+
+  /*!
+   * \brief Add a new statement to the stack, which becomes the current scope
+   * \param stmt A for-loop statement or a block statement
+   * \return A sref to the stmt
+   */
+  void PushSRef(const StmtNode* stmt) {
+    if (srefs_.empty()) {
+      srefs_.push_back(
+          StmtSRef(stmt,
+                   /*parent=*/nullptr,
+                   /*seq_index=*/-1));  // `seq_index` will be set properly in SetSeqIndex
+    } else {
+      StmtSRefNode* parent = srefs_.back().get();
+      srefs_.push_back(
+          StmtSRef(stmt, parent,
+                   /*seq_index=*/-1));  // `seq_index` will be set properly in SetSeqIndex
+    }
+  }
+
+  /*! \brief Pop the top of the scope and record it in stmt2ref map */
+  void PopAndRecordSRef() {
+    StmtSRef sref = std::move(srefs_.back());
+    self_->stmt2ref[sref->stmt] = sref;
+    srefs_.pop_back();
+  }
+
+  void VisitStmt_(const ForNode* loop) final {
+    PushSRef(loop);
+    VisitStmt(loop->body);
+    PopAndRecordSRef();
+  }
+
+  void VisitStmt_(const BlockRealizeNode* realize) final {
+    const BlockNode* block = realize->block.get();
+    PushSRef(block);
+    VisitStmt(block->body);  // `block->init` is not visited
+    PopAndRecordSRef();
+  }
+
+  void VisitStmt_(const SeqStmtNode* seq_stmt) final {
+    // Set `seq_index` information for SeqStmtNode
+    StmtVisitor::VisitStmt_(seq_stmt);
+    SetSeqIndexInChildren(self_, seq_stmt);
+  }
+
+  /*! \brief The result ScheduleStateNode */
+  ScheduleStateNode* self_;
+  /*! \brief The stack frame used to indicate the current scope */
+  std::vector<StmtSRef> srefs_;
 };
 
 /**************** Constructor ****************/
@@ -799,7 +857,7 @@ class ChildReplacer : private StmtMutator {
       } else if (const auto* realize = stmt.as<BlockRealizeNode>()) {
         // Case 2. stmt is BlockRealize, src_stmt is Block
         if (realize->block.get() == src_stmt) {
-          const auto* tgt_block = TVM_TYPE_AS(tgt_block, tgt_stmt_, BlockNode);
+          const auto* tgt_block = TVM_TYPE_AS(tgt_stmt_, BlockNode);
           ObjectPtr<BlockRealizeNode> new_realize = make_object<BlockRealizeNode>(*realize);
           new_realize->block = GetRef<Block>(tgt_block);
           new_stmt = BlockRealize(std::move(new_realize));
@@ -992,9 +1050,9 @@ void ScheduleStateNode::Replace(const tir::StmtSRef& _src_sref, const Stmt& tgt_
     // If `g_func` was unique, after the 3 lines above:
     //   `ref_new_func` points to the same unique function that `g_func` points to
     // Update the body of the function the sref belongs to Assign
-    const auto* realize = TVM_TYPE_AS(realize, g_func->body, BlockRealizeNode);
+    const auto* realize = TVM_TYPE_AS(g_func->body, BlockRealizeNode);
     // Make `child_tgt_stmt` the root block
-    const auto* child_block = TVM_TYPE_AS(child_block, child_tgt_stmt, BlockNode);
+    const auto* child_block = TVM_TYPE_AS(child_tgt_stmt, BlockNode);
     ObjectPtr<BlockRealizeNode> new_realize = make_object<BlockRealizeNode>(*realize);
     new_realize->block = GetRef<Block>(child_block);
     new_func->body = BlockRealize(std::move(new_realize));
@@ -1026,12 +1084,16 @@ void ScheduleStateNode::DebugVerify() const {
 /**************** BlockInfo-related ****************/
 
 BlockInfo ScheduleStateNode::GetBlockInfo(const StmtSRef& block_sref) const {
-  const BlockNode* block = TVM_SREF_TO_BLOCK(block, block_sref);
+  TVM_SREF_TO_BLOCK(block_sref);
   auto it = this->block_info.find(block_sref);
   CHECK(it != this->block_info.end())
       << "IndexError: Cannot find the corresponding BlockScope to the block sref:\n"
       << GetRef<Stmt>(block_sref->stmt);
   return it->second;
+}
+
+void ScheduleStateNode::UpdateScopeBlockInfo(const Stmt& stmt) {
+  BlockInfoCollector::Collect(this, stmt);
 }
 
 TVM_DLL Array<Bool> GetCachedFlags(const ScheduleState& self, const StmtSRef& block_sref) {

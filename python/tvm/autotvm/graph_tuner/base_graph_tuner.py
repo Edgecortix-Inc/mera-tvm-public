@@ -166,7 +166,7 @@ class BaseGraphTuner(object):
         if isinstance(graph, relay.function.Function):
             node_dict = {}
             graph = bind_inputs(graph, input_shapes, dtype)
-            expr2graph(graph, self._target_ops, node_dict, self._node_list)
+            expr2graph(graph, self._target_ops, node_dict, self._node_list, target)
         else:
             raise RuntimeError("Unsupported graph type: %s" % str(type(graph)))
 
@@ -443,7 +443,7 @@ class BaseGraphTuner(object):
             Accept a user-supplied runner
         """
         self._logger.info("Start to benchmark layout transformation...")
-        self._target, target_host = Target.check_and_update_host_consist(self._target, target_host)
+        self._target, target_host = Target.canon_target_and_host(self._target, target_host)
 
         if layout_records is None and infer_layout:
             raise RuntimeError("Requires some records to infer layout transformation time.")

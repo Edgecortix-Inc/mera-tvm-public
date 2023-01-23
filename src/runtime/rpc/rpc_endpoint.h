@@ -34,6 +34,7 @@
 #include "../../support/ring_buffer.h"
 #include "../minrpc/rpc_reference.h"
 #include "rpc_channel.h"
+#include "rpc_channel_logger.h"
 #include "rpc_session.h"
 
 namespace tvm {
@@ -161,13 +162,13 @@ class RPCEndpoint {
    * \param channel The communication channel.
    * \param name The local name of the session, used for debug
    * \param remote_key The remote key of the session
-   * \param fshutdown The shutdown Packed function
    *   if remote_key equals "%toinit", we need to re-intialize
    *   it by event handler.
+   * \param fcleanup The cleanup Packed function.
    */
   static std::shared_ptr<RPCEndpoint> Create(std::unique_ptr<RPCChannel> channel, std::string name,
                                              std::string remote_key,
-                                             TypedPackedFunc<void()> fshutdown = nullptr);
+                                             TypedPackedFunc<void()> fcleanup = nullptr);
 
  private:
   class EventHandler;
@@ -180,6 +181,7 @@ class RPCEndpoint {
   void Shutdown();
   // Internal channel.
   std::unique_ptr<RPCChannel> channel_;
+
   // Internal mutex
   std::mutex mutex_;
   // Internal ring buffer.
@@ -192,8 +194,8 @@ class RPCEndpoint {
   std::string name_;
   // The remote key
   std::string remote_key_;
-  // The shutdown Packed Function
-  TypedPackedFunc<void()> fshutdown_;
+  // Invoked when the RPC session is terminated
+  TypedPackedFunc<void()> fcleanup_;
 };
 
 /*!

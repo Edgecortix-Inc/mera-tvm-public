@@ -67,7 +67,7 @@ class PooledAllocator final : public Allocator {
     }
 
     used_memory_.fetch_add(size, std::memory_order_relaxed);
-    DLOG(INFO) << "allocate " << size << " B, used memory " << used_memory_ << " B";
+    VLOG(1) << "allocate " << size << " B, used memory " << used_memory_ << " B";
     return buf;
   }
 
@@ -77,7 +77,7 @@ class PooledAllocator final : public Allocator {
       memory_pool_.emplace(buffer.size, std::vector<Buffer>{});
     }
     memory_pool_.at(buffer.size).push_back(buffer);
-    DLOG(INFO) << "reclaim buffer " << buffer.size;
+    VLOG(1) << "reclaim buffer " << buffer.size;
   }
 
   size_t UsedMemory() const override { return used_memory_.load(std::memory_order_relaxed); }
@@ -93,13 +93,13 @@ class PooledAllocator final : public Allocator {
     }
     memory_pool_.clear();
     used_memory_ = 0;
-    DLOG(INFO) << "release all buffers";
+    VLOG(1) << "release all buffers";
   }
 
  private:
   size_t page_size_;
   std::atomic<size_t> used_memory_;
-  std::unordered_map<size_t, std::vector<Buffer> > memory_pool_;
+  std::unordered_map<size_t, std::vector<Buffer>> memory_pool_;
   std::recursive_mutex mu_;
   Device device_;
 };

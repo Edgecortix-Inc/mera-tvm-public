@@ -29,7 +29,9 @@
 #ifndef TVM_DRIVER_DRIVER_API_H_
 #define TVM_DRIVER_DRIVER_API_H_
 
+#include <tvm/ir/global_var_supply.h>
 #include <tvm/ir/module.h>
+#include <tvm/ir/transform.h>
 #include <tvm/runtime/packed_func.h>
 #include <tvm/support/with.h>
 #include <tvm/target/target.h>
@@ -43,6 +45,34 @@
 #include <vector>
 
 namespace tvm {
+using tvm::transform::Pass;
+
+/*!
+ * \brief Configures and returns the composite Pass for the fused module (pre split) that contains
+ * device and host code.
+ * \param mixed_mod The original mixed module.
+ * \param target The device Target.
+ * \return The composite Pass for the fused module.
+//  */
+TVM_DLL transform::Sequential MixedModulePassManager(IRModule mixed_mod, Target target);
+
+/*!
+ * \brief Configures and returns the composite Pass for the device Target after device/host from
+ * mixed module.
+ * \param mixed_mod The optimized mixed module.
+ * \param target The device Target.
+ * \return The composite Pass for the device module.
+ */
+TVM_DLL transform::Sequential DeviceModulePassManager(IRModule mixed_mod, Target target);
+
+/*!
+ * \brief Configures and returns the composite Pass for the host Target after device/host from mixed
+ * module.
+ * \param mixed_mod The optimized mixed module.
+ * \param target_host The host Target.
+ * \return The composite Pass for the host module.
+ */
+TVM_DLL transform::Sequential HostModulePassManager(IRModule mixed_mod, Target target_host);
 
 /*!
  * \brief Lower an IRModule (optimize with it with the pass list defined in CreatePassList)
@@ -70,6 +100,7 @@ TVM_DLL IRModule LowerPrimFunc(tvm::tir::PrimFunc func, const std::string& name,
  * \param args The arguments to the function.
  * \param name The name of the lowered function.
  * \param binds Buffer assignments.
+ * \param global_var_supply The GlobalVarSupply to be used in the module.
  * \param simple_mode Disables the loop partition pass. Defaults to false.
  * \return The result module.
  */
@@ -77,7 +108,7 @@ TVM_DLL IRModule LowerPrimFunc(tvm::tir::PrimFunc func, const std::string& name,
 TVM_DLL IRModule LowerSchedule(te::Schedule sch, const Array<te::Tensor>& args,
                                const std::string& name,
                                const std::unordered_map<te::Tensor, tir::Buffer>& binds,
-                               bool simple_mode = false);
+                               GlobalVarSupply global_var_supply, bool simple_mode = false);
 
 /*!
  * \brief Build an IRModule given a TE schedule, args and binds. This function also applies
@@ -86,13 +117,14 @@ TVM_DLL IRModule LowerSchedule(te::Schedule sch, const Array<te::Tensor>& args,
  * \param args The arguments to the function (Array of Tensor, Buffer and Vars)
  * \param name The name of the lowered function.
  * \param binds Buffer assignments.
+ * \param global_var_supply The GlobalVarSupply to be used in the module.
  * \param simple_mode Disables the loop partition pass. Defaults to false.
  * \return The result module.
  */
 TVM_DLL IRModule LowerSchedule(te::Schedule sch, const Array<ObjectRef>& args,
                                const std::string& name,
                                const std::unordered_map<te::Tensor, tir::Buffer>& binds,
-                               bool simple_mode = false);
+                               GlobalVarSupply global_var_supply, bool simple_mode = false);
 
 /*!
  * \brief Create an IRModule out of a TE Schedule. It does not apply lowering passes. If you want
@@ -101,10 +133,13 @@ TVM_DLL IRModule LowerSchedule(te::Schedule sch, const Array<ObjectRef>& args,
  * \param args The arguments to the function.
  * \param name The name of the lowered function.
  * \param binds Buffer assignments.
+ * \param global_var_supply The GlobalVarSupply to be used in the module and when creating
+ * GlobalVars.
  * \return The result module.
  */
 IRModule ScheduleToModule(te::Schedule sch, const Array<ObjectRef>& args, const std::string& name,
-                          const std::unordered_map<te::Tensor, tir::Buffer>& binds);
+                          const std::unordered_map<te::Tensor, tir::Buffer>& binds,
+                          GlobalVarSupply global_var_supply);
 /*!
  * \brief Build a device and host module for a specific target from an IRModule.
  * \param funcs The functions to be built.

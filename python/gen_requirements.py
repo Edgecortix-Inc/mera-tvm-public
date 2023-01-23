@@ -91,6 +91,18 @@ REQUIREMENTS_BY_PIECE: RequirementsByPieceType = [
     ),
     # Relay frontends.
     (
+        "importer-caffe",
+        (
+            "Requirements for the Caffe importer",
+            [
+                "numpy",
+                "protobuf",
+                "scikit-image",
+                "six",
+            ],
+        ),
+    ),
+    (
         "importer-caffe2",
         (
             "Requirements for the Caffe2 importer",
@@ -113,11 +125,16 @@ REQUIREMENTS_BY_PIECE: RequirementsByPieceType = [
             [
                 "future",  # Hidden dependency of torch.
                 "onnx",
+                "onnxoptimizer",
                 "onnxruntime",
                 "torch",
                 "torchvision",
             ],
         ),
+    ),
+    (
+        "importer-paddle",
+        ("Requirements for the PaddlePaddle importer", ["paddlepaddle"]),
     ),
     (
         "importer-pytorch",
@@ -143,9 +160,12 @@ REQUIREMENTS_BY_PIECE: RequirementsByPieceType = [
         (
             "Requirements for the tvmc command-line tool",
             [
+                "ethos-u-vela",
                 "future",  # Hidden dependency of torch.
                 "onnx",
+                "onnxoptimizer",
                 "onnxruntime",
+                "paddlepaddle",
                 "tensorflow",
                 "tflite",
                 "torch",
@@ -197,6 +217,7 @@ REQUIREMENTS_BY_PIECE: RequirementsByPieceType = [
                 "sphinx_autodoc_annotation",
                 "sphinx_gallery",
                 "sphinx_rtd_theme",
+                "types-psutil",
             ],
         ),
     ),
@@ -237,7 +258,7 @@ CONSTRAINTS = [
         "docutils",
         "<0.17",
     ),  # Work around https://github.com/readthedocs/sphinx_rtd_theme/issues/1115
-    ("ethos-u-vela", "==2.1.1"),
+    ("ethos-u-vela", "==3.2.0"),
     ("future", None),
     ("h5py", "==2.10.0"),
     ("image", None),
@@ -245,25 +266,30 @@ CONSTRAINTS = [
     ("mera-tvm-internal", MTVM_CURR_VERSION),
     ("numpy", None),
     ("onnx", None),
+    ("onnxoptimizer", None),
     ("onnxruntime", None),
     ("opencv-python", None),
+    ("paddlepaddle", None),
     ("pillow", None),
     ("progressbar", None),
+    ("protobuf", None),
     ("psutil", None),
     ("pylint", None),
+    ("scikit-image", None),
     ("scipy", None),
+    ("six", None),
     ("sphinx", None),
     ("sphinx_autodoc_annotation", None),
     ("sphinx_gallery", None),
     ("sphinx_rtd_theme", None),
-    ("synr", "==0.4.0"),
+    ("synr", "==0.6.0"),
     ("tensorflow", None),
     ("tensorflow-estimator", None),
     ("tflite", None),
     ("torch", None),
     ("torchvision", None),
     ("tornado", None),
-    ("xgboost", ">=1.1.0"),  # From PR #4953.
+    ("xgboost", ">=1.1.0,<1.6.0"),  # From PR #4953 & Issue #12009
 ]
 
 ################################################################################
