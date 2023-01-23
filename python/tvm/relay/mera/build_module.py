@@ -19,6 +19,7 @@
 import os
 import logging
 import sys
+import numpy as np
 
 from ... import get_global_func, runtime
 from ... import tir
@@ -35,6 +36,8 @@ from ..expr_functor import ExprMutator, ExprVisitor
 from ...ir.transform import Sequential, PassContext
 from ...contrib import graph_executor, cc
 from ..._ffi.base import TVMError, register_error
+
+logger = logging.getLogger('mera-tvm')
 
 @register_error
 class MeraError(TVMError):
@@ -59,6 +62,7 @@ class BuildConfig(object):
         "sim_freq_mhz" : 800,
         "manual_sg_merge_map" : "",
         "use_legacy_sg_cutting": "false",
+        "batch_cutting_factor": 1,
         "scheduler_config": {
             "mode": "Fast",
             "pre_scheduling_iterations": 8000,
@@ -171,6 +175,7 @@ def _set_config(cfg, use_interpreter):
     if not use_interpreter:
         mera_set_arch = get_global_func("relay.ext.mera.set_arch")
         mera_set_arch(arch_config_str)
+    return compiler_config_str, arch_config_str
 
 
 class IsComputeIntensiveGraph(ExprVisitor):
@@ -247,7 +252,7 @@ def prune_no_mac_subgraphs(mod, compiler_name = "mera"):
     subgraphs_to_remove = []
     for subgraph in mod.get_global_vars():
         name = subgraph.name_hint
-        if not mod[name].attrs or mod[name].attrs["Compiler"] != compiler_name:
+        if not mod[name].attrs or "Compiler" not in mod[name].attrs or mod[name].attrs["Compiler"] != compiler_name:
             continue
         if not IsComputeIntensiveGraph().is_compute_intensive_graph(mod[name].body):
             subgraphs_to_remove.append(name)
@@ -259,6 +264,56 @@ def prune_no_mac_subgraphs(mod, compiler_name = "mera"):
     return new_mod
 
 
+def gather_captured_stats_pass(mod):
+    """Generates statistics about captured nodes for MERA. """
+    class CaptureStatsCollectorVisitor(ExprVisitor):
+        def __init__(self):
+            super().__init__()
+            self.data = {}
+
+        def __add(self, op):
+            if op not in self.data:
+                self.data[op] = 0
+            self.data[op] = self.data[op] + 1
+
+        def visit_call(self, call):
+            if not isinstance(call.op, Function) and not isinstance(call.op, GlobalVar):
+                self.__add(str(call.op))
+            return super().visit_call(call)
+
+        def run(self, mod):
+            self.visit(mod)
+            return self.data
+    data = {}
+    for subgraph in mod.get_global_vars():
+        name = subgraph.name_hint
+        codegen = mod[name].attrs["Compiler"] if mod[name].attrs and "Compiler" in mod[name].attrs else "TVM"
+        if codegen not in data:
+            data[codegen] = {}
+        data[codegen][name] = CaptureStatsCollectorVisitor().run(mod[name])
+    return data
+
+def report_captured_stats(stats):
+    total_captured = 0
+    total_uncaptured = 0
+    def __calc_captured(d):
+        x = 0
+        for sg_data in d.values():
+            for op_count in sg_data.values():
+                x += int(op_count)
+        return x
+    captured_regions = 0
+    for codegen, cdgen_data in stats.items():
+        if codegen == "TVM":
+            total_uncaptured = __calc_captured(cdgen_data)
+        else:
+            captured_regions = len(cdgen_data.values())
+            total_captured += __calc_captured(cdgen_data)
+    total = total_captured + total_uncaptured
+    logger.info(f'MERA model report: Captured {total_captured} operators and left {total_uncaptured} uncaptured '
+        + f'({total_captured / total * 100:.1f}%) in {captured_regions} MERA regions.')
+
+
 def _build_common(mod, params, target_tvm, fcompile, layout, output_dir, aux_config):
     assert get_global_func("relay.ext.mera")
 
@@ -267,7 +322,8 @@ def _build_common(mod, params, target_tvm, fcompile, layout, output_dir, aux_con
 
     use_interpreter = cfg.compiler_config["target"] in ["Interpreter", "InterpreterHw"]
 
-    _set_config(cfg, use_interpreter)
+    # TODO - Remove need to use API calls for set cfg
+    ccfg_str, arch_cfg_str = _set_config(cfg, use_interpreter)
 
     if aux_config["with_clip_pattern"]:
         pattern_table = get_pattern_table("mera_with_clip")
@@ -296,7 +352,11 @@ def _build_common(mod, params, target_tvm, fcompile, layout, output_dir, aux_con
                     return True
                 return False
 
-            desired_layout = {"qnn.conv2d": ["NHWC", "default"]}
+            desired_layout = {
+                "qnn.conv2d": ["NHWC", "default"],
+                "image.resize2d": ["NHWC"],
+                "nn.max_pool2d": ["NHWC"]
+            }
             layout_transform = Sequential(
                 [
                     transform.ConvertLayout(desired_layout),
@@ -323,12 +383,15 @@ def _build_common(mod, params, target_tvm, fcompile, layout, output_dir, aux_con
 
         partitioned = composite_partition(mod)
         pruned = prune_no_mac_subgraphs(partitioned)
+        report_captured_stats(gather_captured_stats_pass(pruned))
 
     input_layout = "NHWC"
     config = {
         "relay.ext.mera.options": {
             "input_layout": input_layout,
             "weight_layout": aux_config["weight_layout"],
+            "mera_ccfg": ccfg_str,
+            "mera_arch": arch_cfg_str
         }
     }
 
@@ -435,33 +498,14 @@ def build_for_tflite(mod, params, host_arch="x86", output_dir=None):
         aux_config={"weight_layout": "HWIO"},
     )
 
-
-def build_fp32(mod, params, host_arch="x86", output_dir=None,  aux_config={}):
-    """Build in fp32 precision and NHWC/IOHW layout"""
+def __run_passes_core(mod, params, target, host_arch, c_cfg, arch_cfg, aux_config, compiler_name):
     if host_arch == "x86":
         target_tvm = "llvm -mcpu=core-avx2"
-        fcompile = cc.create_shared
     else:
         assert host_arch == "arm"
         target_tvm = "llvm -device=arm_cpu -mtriple=aarch64-linux-gnu -mattr=+neon"
-        fcompile = cc.cross_compiler("aarch64-linux-gnu-g++")
-
-    if output_dir is None:
-        output_dir = "_out"
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    if "prequantize_input" not in aux_config:
-        aux_config["prequantize_input"] = False
-
-    assert get_global_func("relay.ext.mera_fp32")
-
-    cfg = BuildConfig.current
-    assert cfg.compiler_config["target"] is not None
-    use_interpreter = cfg.compiler_config["target"] in ["Interpreter", "InterpreterHw"]
-    c_cfg, arch_cfg = parse_config(cfg, use_interpreter)
-
-    pattern_table = get_pattern_table("mera_fp32")
+    assert get_global_func(f"relay.ext.{compiler_name}")
+    pattern_table = get_pattern_table(compiler_name)
 
     if params:
         mod["main"] = bind_params_by_name(mod["main"], params)
@@ -472,10 +516,15 @@ def build_fp32(mod, params, host_arch="x86", output_dir=None,  aux_config={}):
             mod = transform.InsertResize(new_in_height, new_in_width)(mod)
 
         # convert layout to NHWC
-        # if the original layout is NHWC, it has no effect
+        # if the original layout is NHWC, it has no effect.
+        # NOTE: Even though we convert to OIHW for MERA, if there is a conv that is left uncaptured
+        # TVM wont be able to run it with that weight layout.
         desired_layouts = {
-            'nn.conv2d': ["NHWC", 'OIHW'],
+            'nn.conv2d': ["NHWC", 'HWIO'],
             'image.resize2d': ['NHWC'],
+            'nn.max_pool2d': ['NHWC'],
+            'nn.avg_pool2d': ['NHWC'],
+            'nn.global_avg_pool2d': ['NHWC'],
         }
         seq = Sequential([transform.FoldExplicitPadding(),
                           transform.RemoveUnusedFunctions(),
@@ -504,50 +553,69 @@ def build_fp32(mod, params, host_arch="x86", output_dir=None,  aux_config={}):
         # BYOC
         pass_list = [
             transform.MergeComposite(pattern_table),
-            transform.AnnotateTarget("mera_fp32"),
+            transform.AnnotateTarget(compiler_name),
             transform.MergeCompilerRegions(),
             transform.PartitionGraph(),
             transform.InlineExternClip(),
             transform.RemoveUnusedFunctions(),
         ]
 
-        if aux_config["prequantize_input"]:
+        if aux_config.get("prequantize_input", False):
             pass_list.append(transform.RemoveInputQuantize())
 
         composite_partition = Sequential(pass_list)
 
-        partitioned = composite_partition(mod)
-        pruned = prune_no_mac_subgraphs(partitioned, "mera_fp32")
-        print(pruned)
+        mod = composite_partition(mod)
+        mod = prune_no_mac_subgraphs(mod, compiler_name)
+        report_captured_stats(gather_captured_stats_pass(mod))
 
     config = {
         "relay.ext.mera.options": {
             "mera_ccfg": c_cfg,
             "mera_arch": arch_cfg,
+            "mera_target": target
         }
     }
 
     with PassContext(opt_level=3, config=config):
         try:
-            json, lib, all_params = _build(pruned, target=target_tvm, params=params)
+            json, lib, all_params = _build(mod, target=target_tvm, params=params)
         except TVMError as ex:
             raise MeraError(f"ERROR found during compilation of MERA model:\n'{str(ex)}'")\
                 .with_traceback(sys.exc_info()[2]) from ex
-
     # remove constants that are embedded in Mera IR
     params = {}
+    mera_globals = [x.name_hint for x in mod.get_global_vars()
+        if mod[x.name_hint].attrs and mod[x.name_hint].attrs["Compiler"] == compiler_name]
     for k, v in all_params.items():
-        if not str(k).startswith("mera"):
+        if not np.any([str(k).startswith(mg) for mg in mera_globals]):
             params[k] = v
+    return json, lib, params, mod
 
-    lib_path = os.path.join(output_dir, "deploy.so")
-    with open(os.path.join(output_dir, "deploy.json"), "w") as f:
-        f.write(json)
-    with open(os.path.join(output_dir, "deploy.params"), "wb") as f:
-        f.write(save_param_dict(params))
 
-    lib.export_library(lib_path, fcompile=fcompile)
-    return json, params, lib_path
+def build_fp32(mod, params, target, host_arch="x86", output_dir = None):
+    """Build in fp32 precision and NHWC/IOHW layout"""
+    if target not in ['Quantizer', 'Interpreter']:
+        raise ValueError(f'Unsupported target for fp32 MERA deployment: {target}')
+    cfg = BuildConfig()
+    cfg.compiler_config['target'] = target
+    ccfg_str, _ = parse_config(cfg, True)
+    json, lib, new_params, new_mod = __run_passes_core(mod, params, target, host_arch, ccfg_str, '', {}, "mera_fp32")
+    if output_dir:
+        # Export data to output dir
+        if host_arch == "x86":
+            fcompile = cc.create_shared
+        else:
+            assert host_arch == "arm"
+            fcompile = cc.cross_compiler("aarch64-linux-gnu-g++")
+        lib_path = os.path.join(output_dir, "deploy.so")
+        with open(os.path.join(output_dir, "deploy.json"), "w") as f:
+            f.write(json)
+        with open(os.path.join(output_dir, "deploy.params"), "wb") as f:
+            f.write(save_param_dict(new_params))
+
+        lib.export_library(lib_path, fcompile=fcompile)
+    return json, lib, new_params, new_mod
 
 
 def load_runtime_module(json, params, lib_path):

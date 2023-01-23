@@ -81,6 +81,21 @@ PackedFunc MeraRuntime::GetFunction(const std::string& name, const ObjectPtr<Obj
       }
       metrics_str_ = mera::execute::Execute(mera_exec_.get(), name, argument_data).AsString();
     });
+  } else if (name == "mera_get_interpreter_buffer") {
+    return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
+      CHECK_EQ(args.num_args, 1);
+      CHECK(interpreter_) << "Function only available for Interpreters";
+      const auto *int_ptr = dynamic_cast<const mera::interpreter::Interpreter_*>(mera_exec_.get());
+      CHECK_NOTNULL(int_ptr);
+      GetInterpreterBufferImpl(rv, int_ptr, args[0].operator std::string());
+    });
+  } else if (name == "mera_get_interpreter_node_list") {
+    return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
+      CHECK(interpreter_) << "Function only available for Interpreters";
+      const auto *int_ptr = dynamic_cast<const mera::interpreter::Interpreter_*>(mera_exec_.get());
+      CHECK_NOTNULL(int_ptr);
+      GetInterpreterNodeListImpl(rv, int_ptr);
+    });
   } else {
     return PackedFunc();
   }
@@ -109,6 +124,43 @@ Module LoadFromBinary(void* strm) {
   code.resize(size);
   stream->ReadArray(code.data(), code.size());
   return MeraRuntimeCreate(code, use_interpreter, func_name);
+}
+
+void GetInterpreterBufferImpl(TVMRetValue *rv, const mera::interpreter::Interpreter_ *impl, const std::string &op_id) {
+  auto buf_data = impl->GetInterpreterBuffer(op_id);
+
+  if (buf_data.has_value()) {
+    const auto shape = buf_data->shape;
+
+    ShapeTuple tvm_shape(shape.begin(), shape.end());
+    DataType tvm_type;
+    switch (buf_data->type) {
+      case mera::ir::DataType::Float32: tvm_type = DataType::Float(32); break;
+      case mera::ir::DataType::Int32: tvm_type = DataType::Int(32); break;
+      case mera::ir::DataType::Int8: tvm_type = DataType::Int(8); break;
+      case mera::ir::DataType::UInt8: tvm_type = DataType::UInt(8); break;
+      default: LOG(FATAL) << "Unknown data type";
+    }
+
+    auto data = NDArray::Empty(tvm_shape, tvm_type, {DLDeviceType::kDLCPU, 0});
+    data.CopyFromBytes(buf_data->data, buf_data->size * tvm_type.bytes());
+    *rv = data;
+  }
+}
+
+void GetInterpreterNodeListImpl(TVMRetValue *rv, const mera::interpreter::Interpreter_ *impl) {
+  std::stringstream ss;
+  const auto node_list = impl->GetInterpreterNodeList();
+  ss << '[';
+  for (size_t i = 0; i < node_list.size(); ++i) {
+    const auto &n = node_list[i];
+    ss << "[\"" << n.id << "\",\"" << n.op_type << "\"]";
+    if (i != node_list.size() - 1) {
+      ss << ',';
+    }
+  }
+  ss << ']';
+  *rv = ss.str();
 }
 
 TVM_REGISTER_GLOBAL("runtime.module.loadbinary_MeraRuntime").set_body_typed(LoadFromBinary);

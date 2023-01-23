@@ -19,6 +19,7 @@
  * under the License.
  */
 #include <mera/mdna_compile.h>
+#include <mera/mdna_quantize.h>
 #include <mera/mdna_ir.h>
 #include <mera/mdna_ir_io.h>
 #include <tvm/relay/attrs/image.h>
@@ -45,9 +46,6 @@ namespace relay {
 namespace contrib {
 
 using namespace backend;
-
-TVM_REGISTER_NODE_TYPE(MeraCompilerConfigNode);
-TVM_REGISTER_PASS_CONFIG_OPTION("relay.ext.mera.options", MeraCompilerConfig);
 
 std::string GetWeightLayout() {
   auto cfg = transform::PassContext::Current()->GetConfig<MeraCompilerConfig>("relay.ext.mera.options");
@@ -202,9 +200,9 @@ class Compiler {
         if (name == "mera.upsampling") {
           const auto* dequantize_call =
               GetRootCall(callee_func->body.as<CallNode>(), 2,
-                          {"qnn.dequantize", "image.resize2d", "qnn.quantize"});
+                          std::vector<std::string>{"qnn.dequantize", "image.resize2d", "qnn.quantize"});
           const auto* upsampling_call =
-              GetRootCall(callee_func->body.as<CallNode>(), 1, {"image.resize2d", "qnn.quantize"});
+              GetRootCall(callee_func->body.as<CallNode>(), 1, std::vector<std::string>{"image.resize2d", "qnn.quantize"});
           const auto dequantize_args = CompileArgs(dequantize_call, callee_scope);
           const auto& input(dequantize_args[0][0]);
           const auto& input_scale(dequantize_args[1][0]);
@@ -227,11 +225,11 @@ class Compiler {
         } else if (name == "mera.leaky_relu") {
           const auto* dequantize_call =
               GetRootCall(callee_func->body.as<CallNode>(), 2,
-                          {"qnn.dequantize", "nn.leaky_relu", "qnn.quantize"});
+                          std::vector<std::string>{"qnn.dequantize", "nn.leaky_relu", "qnn.quantize"});
           const auto* leaky_relu_call =
-              GetRootCall(callee_func->body.as<CallNode>(), 1, {"nn.leaky_relu", "qnn.quantize"});
+              GetRootCall(callee_func->body.as<CallNode>(), 1, std::vector<std::string>{"nn.leaky_relu", "qnn.quantize"});
           const auto dequantize_args = CompileArgs(dequantize_call, callee_scope);
-          const auto* quantize_call = GetRootCall(callee_func->body.as<CallNode>(), 0, {"qnn.quantize"});
+          const auto* quantize_call = GetRootCall(callee_func->body.as<CallNode>(), 0, std::vector<std::string>{"qnn.quantize"});
           const auto quantize_args = CompileArgs(quantize_call, callee_scope);
           const auto& input(dequantize_args[0][0]);
           const auto& input_scale(dequantize_args[1][0]);
@@ -242,7 +240,7 @@ class Compiler {
           return {graph.Add<mera::ir::LeakyReLU>("LeakyReLU", input.type, input.shape, input, input_scale,
               input_zero_point, output_scale, output_zero_point, leaky_relu_attr->alpha)};
         } else if (name == "mera.tflite_silu") {
-          const auto* mul_call = GetRootCall(callee_func->body.as<CallNode>(), 0, {"qnn.mul"});
+          const auto* mul_call = GetRootCall(callee_func->body.as<CallNode>(), 0, std::vector<std::string>{"qnn.mul"});
           auto tensors_input = compiler.Compile(callee_scope, mul_call->args[0]);
           auto tensors_lhs_scale = compiler.Compile(callee_scope, mul_call->args[2]);
           auto tensors_lhs_zp = compiler.Compile(callee_scope, mul_call->args[3]);
@@ -276,13 +274,13 @@ class Compiler {
           bool with_req = IsOp(call, "qnn.requantize");
           if (with_req) {
             dequantize_call = GetRootCall(callee_func->body.as<CallNode>(), 4,
-              {"qnn.dequantize", "multiply", "divide", "qnn.quantize", "qnn.requantize"});
-            quantize_call = GetRootCall(call, 1, {"qnn.quantize", "qnn.requantize"});
-            req_call = GetRootCall(call, 0, {"qnn.requantize"});
+              std::vector<std::string>{"qnn.dequantize", "multiply", "divide", "qnn.quantize", "qnn.requantize"});
+            quantize_call = GetRootCall(call, 1, std::vector<std::string>{"qnn.quantize", "qnn.requantize"});
+            req_call = GetRootCall(call, 0, std::vector<std::string>{"qnn.requantize"});
           } else {
             dequantize_call = GetRootCall(callee_func->body.as<CallNode>(), 3,
-              {"qnn.dequantize", "multiply", "divide", "qnn.quantize"});
-            quantize_call = GetRootCall(call, 0, {"qnn.quantize"});
+              std::vector<std::string>{"qnn.dequantize", "multiply", "divide", "qnn.quantize"});
+            quantize_call = GetRootCall(call, 0, std::vector<std::string>{"qnn.quantize"});
           }
           std::vector<mera::ir::Tensor> tensors_out_scale;
           std::vector<mera::ir::Tensor> tensors_out_zp;
@@ -312,25 +310,25 @@ class Compiler {
 
           const bool with_cast = IsOp(call, "cast");
           if (!with_cast) {
-            req_call = GetRootCall(call, 0, {"qnn.requantize"});
-            bias_call = GetRootCall(req_call->args[0].as<CallNode>(), 0, {"nn.bias_add"});
+            req_call = GetRootCall(call, 0, std::vector<std::string>{"qnn.requantize"});
+            bias_call = GetRootCall(req_call->args[0].as<CallNode>(), 0, std::vector<std::string>{"nn.bias_add"});
           } else {
-            req_call = GetRootCall(call, 2, {"qnn.requantize", "clip", "cast"});
-            bias_call = GetRootCall(req_call->args[0].as<CallNode>(), 0, {"nn.bias_add"});
+            req_call = GetRootCall(call, 2, std::vector<std::string>{"qnn.requantize", "clip", "cast"});
+            bias_call = GetRootCall(req_call->args[0].as<CallNode>(), 0, std::vector<std::string>{"nn.bias_add"});
           }
-          dense_call = GetRootCall(bias_call->args[0].as<CallNode>(), 0, {"qnn.dense"});
+          dense_call = GetRootCall(bias_call->args[0].as<CallNode>(), 0, std::vector<std::string>{"qnn.dense"});
           const bool with_squeeze = IsOp(dense_call->args[0].as<CallNode>(), "squeeze");
           if (with_squeeze) {
-            in_tensor = GetRootCall(dense_call->args[0].as<CallNode>(), 1, {"reshape", "squeeze"});
+            in_tensor = GetRootCall(dense_call->args[0].as<CallNode>(), 1, std::vector<std::string>{"reshape", "squeeze"});
           } else {
-            in_tensor = GetRootCall(dense_call->args[0].as<CallNode>(), 2, {"transpose", "reshape", "reshape"});
+            in_tensor = GetRootCall(dense_call->args[0].as<CallNode>(), 2, std::vector<std::string>{"transpose", "reshape", "reshape"});
           }
 
           auto input_tensor_in = compiler.Compile(callee_scope, in_tensor->args[0]);
           // If weights are supplied unquantized, grab the unquantized values
           const auto* weights_call = dense_call->args[1].as<CallNode>();
           auto weights_tensor_in = (weights_call != nullptr && IsOp(weights_call, "qnn.quantize")) ?
-            compiler.Compile(callee_scope, GetRootCall(dense_call->args[1].as<CallNode>(), 0, {"qnn.quantize"})->args[0])
+            compiler.Compile(callee_scope, GetRootCall(dense_call->args[1].as<CallNode>(), 0, std::vector<std::string>{"qnn.quantize"})->args[0])
             : compiler.Compile(callee_scope, dense_call->args[1]);
           auto dense_input_zero_point_in = compiler.Compile(callee_scope, dense_call->args[2]);
           auto dense_weight_zero_point_in = compiler.Compile(callee_scope, dense_call->args[3]);
@@ -369,11 +367,11 @@ class Compiler {
         } else if (name == "mera.avg_pooling2d") {
           const auto& call = callee_func->body.as<CallNode>();
           const CallNode *in_call;
-          const bool with_adaptive = IsOp(GetRootCall(call, 0, {"cast"})->args[0].as<CallNode>(), "nn.adaptive_avg_pool2d");
+          const bool with_adaptive = IsOp(GetRootCall(call, 0, std::vector<std::string>{"cast"})->args[0].as<CallNode>(), "nn.adaptive_avg_pool2d");
           if (with_adaptive) {
-            in_call = GetRootCall(call, 2, {"cast", "nn.adaptive_avg_pool2d", "cast"});
+            in_call = GetRootCall(call, 2, std::vector<std::string>{"cast", "nn.adaptive_avg_pool2d", "cast"});
           } else {
-            in_call = GetRootCall(call, 4, {"nn.pad", "nn.pad", "cast", "nn.avg_pool2d", "cast"});
+            in_call = GetRootCall(call, 4, std::vector<std::string>{"nn.pad", "nn.pad", "cast", "nn.avg_pool2d", "cast"});
           }
 
           auto input_tensor_in = compiler.Compile(callee_scope, in_call->args[0]);
@@ -386,8 +384,8 @@ class Compiler {
         } else if (name == "mera.mean") {
           const auto& call = callee_func->body.as<CallNode>();
 
-          const auto* requantize = GetRootCall(call, 0, {"qnn.requantize"});
-          const auto* in_call = GetRootCall(call, 2, {"cast", "mean", "qnn.requantize"});
+          const auto* requantize = GetRootCall(call, 0, std::vector<std::string>{"qnn.requantize"});
+          const auto* in_call = GetRootCall(call, 2, std::vector<std::string>{"cast", "mean", "qnn.requantize"});
 
           auto tensor_in_scale = compiler.Compile(callee_scope, requantize->args[1]);
           auto tensor_in_zp = compiler.Compile(callee_scope, requantize->args[2]);
@@ -858,7 +856,57 @@ runtime::Module CompileModuleFp32(const ObjectRef &ref) {
   input.shape = shape;
   input.strides = nullptr;
   input.byte_offset = 0;
-  bool interpreter = cdgen_cfg->mera_arch.empty();
+
+  if (cdgen_cfg->mera_target == "Quantizer") {
+    const auto* pf = runtime::Registry::Get("runtime.module.mera_quantizer_create");
+    CHECK_NOTNULL(pf);
+    return (*pf)(&input, func_name);
+  } else {
+    CHECK_EQ(cdgen_cfg->mera_target, "Interpreter") << "Only Interpreter target allowed for fp32 MERA, not '"
+      << cdgen_cfg->mera_target << "'";
+    const auto* pf = runtime::Registry::Get("runtime.module.mera_module_create_empty");
+    CHECK_NOTNULL(pf);
+    return (*pf)(&input, true, func_name);
+  }
+}
+
+runtime::Module CompileModuleQuantized(const ObjectRef &ref) {
+  CHECK(ref->IsInstance<FunctionNode>());
+  auto func = Downcast<Function>(ref);
+  CHECK(func.defined()) << "Expected a Relay function";
+  auto func_name = GetExtSymbol(func);
+  auto mod = IRModule::FromExpr(func);
+  auto cdgen_cfg = GetMeraCompilerConfig();
+
+  CHECK_EQ(mod->functions.size(), 1);
+  const auto f_compile = Downcast<Function>((*mod->functions.begin()).second);
+
+  const auto *res_root = f_compile.as<FunctionNode>();
+  CHECK_NOTNULL(res_root);
+  const auto *res_call = res_root->body.as<CallNode>();
+  CHECK_NOTNULL(res_call);
+  CHECK(res_call->op.as<OpNode>() && res_call->op.as<OpNode>()->name == "mera_quantized_result")
+    << "Relay is not a MERA quantized result";
+  const auto *mera_data = res_call->args[1].as<ConstantNode>();
+  CHECK_NOTNULL(mera_data);
+  CHECK_EQ(mera_data->data.Shape().size(), 1);
+  std::vector<uint8_t> data_raw(mera_data->data.Shape().at(0));
+  mera_data->data.CopyToBytes(data_raw.data(), data_raw.size());
+
+  const auto mera_mod = mera::quantizer::LoadMeraQuantizedModule(data_raw, func_name);
+  // Call MERA compiler
+  std::vector<uint8_t> code = mera::compile::Compile(mera_mod, cdgen_cfg->mera_arch, cdgen_cfg->mera_ccfg);
+
+  DLTensor input;
+  input.data = code.data();
+  input.device = DLDevice{kDLCPU, 0};
+  input.ndim = 1;
+  input.dtype = DLDataType{kDLUInt, 8, 1};
+  int64_t shape[] = {int64_t(code.size())};
+  input.shape = shape;
+  input.strides = nullptr;
+  input.byte_offset = 0;
+  bool interpreter = mera_arch.empty();
   const auto* pf = runtime::Registry::Get("runtime.module.mera_module_create_empty");
   return (*pf)(&input, interpreter, func_name);
 }
@@ -870,6 +918,8 @@ runtime::Module MeraCompiler(const ObjectRef& ref) {
 TVM_REGISTER_GLOBAL("relay.ext.mera").set_body_typed(MeraCompiler);
 
 TVM_REGISTER_GLOBAL("relay.ext.mera_fp32").set_body_typed(CompileModuleFp32);
+
+TVM_REGISTER_GLOBAL("relay.ext.mera_qtz").set_body_typed(CompileModuleQuantized);
 
 void SetMeraArch(const std::string& arch) { mera_arch = arch; }
 TVM_REGISTER_GLOBAL("relay.ext.mera.set_arch").set_body_typed(SetMeraArch);

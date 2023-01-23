@@ -116,18 +116,18 @@ def find_lib_path(name=None, search_path=None, optional=False):
         runtime_dll_path = []
     else:
         if sys.platform.startswith("win32"):
-            lib_dll_path = [os.path.join(p, "libmeratvm.dll") for p in dll_path] + [
-                os.path.join(p, "meratvm.dll") for p in dll_path
-            ]
-            runtime_dll_path = [os.path.join(p, "libmeratvm_runtime.dll") for p in dll_path] + [
-                os.path.join(p, "meratvm_runtime.dll") for p in dll_path
-            ]
+            lib_dll_names = ["libmeratvm.dll", "meratvm.dll"]
+            runtime_dll_names = ["libmeratvm_runtime.dll", "meratvm_runtime.dll"]
         elif sys.platform.startswith("darwin"):
-            lib_dll_path = [os.path.join(p, "libmeratvm.dylib") for p in dll_path]
-            runtime_dll_path = [os.path.join(p, "libmeratvm_runtime.dylib") for p in dll_path]
+            lib_dll_names = ["libmeratvm.dylib"]
+            runtime_dll_names = ["libmeratvm_runtime.dylib"]
         else:
-            lib_dll_path = [os.path.join(p, "libmeratvm.so") for p in dll_path]
-            runtime_dll_path = [os.path.join(p, "libmeratvm_runtime.so") for p in dll_path]
+            lib_dll_names = ["libmeratvm.so"]
+            runtime_dll_names = ["libmeratvm_runtime.so"]
+
+        name = lib_dll_names + runtime_dll_names
+        lib_dll_path = [os.path.join(p, name) for name in lib_dll_names for p in dll_path]
+        runtime_dll_path = [os.path.join(p, name) for name in runtime_dll_names for p in dll_path]
 
     if not use_runtime:
         # try to find lib_dll_path
@@ -222,4 +222,4 @@ def find_include_path(name=None, search_path=None, optional=False):
 # We use the version of the incoming release for code
 # that is under development.
 # The following line is set by tvm/python/update_version.py
-__version__ = "1.2"
+__version__ = "1.3"

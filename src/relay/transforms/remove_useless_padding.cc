@@ -33,7 +33,7 @@ namespace relay {
 bool IsUselessPadding(const PadAttrs* param) {
   for (size_t i = 0; i < param->pad_width.size(); ++i) {
     for (size_t j = 0; j < param->pad_width[0].size(); ++j) {
-      if (int(param->pad_width[i][j]) > 0) {
+      if (param->pad_width[i][j]->value > 0) {
         return false;
       }
     }

@@ -20,15 +20,14 @@
  */
 
 /*!
- * \brief Mera runtime containing only tvm PackedFunc.
- * \file ec_runtime.h
+ * \brief MERA quantizer runtime containing only tvm PackedFunc.
+ * \file mera_quantizer_runtime.h
  */
-#ifndef TVM_RUNTIME_CONTRIB_EC_EC_RUNTIME_H_
-#define TVM_RUNTIME_CONTRIB_EC_EC_RUNTIME_H_
+#ifndef TVM_RUNTIME_CONTRIB_MERA_QUANTIZER_RUNTIME_H_
+#define TVM_RUNTIME_CONTRIB_MERA_QUANTIZER_RUNTIME_H_
 
 #include <dlpack/dlpack.h>
-#include <mera/mdna_execute.h>
-#include <mera/mdna_interpreter.h>
+#include <mera/mdna_quantize.h>
 #include <tvm/runtime/ndarray.h>
 #include <tvm/runtime/packed_func.h>
 
@@ -40,18 +39,16 @@ namespace tvm {
 namespace runtime {
 
 /*!
- * \brief Mera runtime.
+ * \brief MERA quantizer runtime.
  *
  *  This runtime can be accessed in various language via
  *  TVM runtime PackedFunc API.
  */
-class MeraRuntime : public ModuleNode {
+class MeraQuantizerRuntime : public ModuleNode {
  public:
-  explicit MeraRuntime(std::vector<uint8_t> code, bool interpreter, const std::string& func_name);
-
-  std::string GetSource(const std::string& format = "");
-
-  void SaveToBinary(dmlc::Stream* stream) final;
+  explicit MeraQuantizerRuntime(const std::vector<uint8_t> &code, const std::string& func_name):
+    mera_quant_(mera::quantizer::CreateQuantizer(code)), code_(code), func_name_(func_name) {}
+  virtual ~MeraQuantizerRuntime() {}
 
   /*!
    * \brief Get member function to front-end.
@@ -64,32 +61,16 @@ class MeraRuntime : public ModuleNode {
   /*!
    * \return The type key of the executor.
    */
-  const char* type_key() const { return "MeraRuntime"; }
+  virtual const char* type_key() const { return "MeraQuantizerRuntime"; }
 
-  /*!
-   * \brief Invoke the internal mera interpreter and run the whole model in
-   * dependency order.
-   */
-  void Invoke();
-
-  /*!
-   * \brief Initialize the mera runtime with context.
-   */
-  void Init();
-
+  std::string GetFuncName() const { return func_name_; }
  private:
-  std::unique_ptr<mera::execute::Executor> mera_exec_;
-  std::vector<uint8_t> code_;
-  bool interpreter_;
+  std::unique_ptr<mera::quantizer::Quantizer> mera_quant_;
+  const std::vector<uint8_t> code_;
   std::string func_name_;
-  std::string metrics_str_;
 };
-
-void GetInterpreterBufferImpl(TVMRetValue *rv, const mera::interpreter::Interpreter_ *impl, const std::string &op_id);
-
-void GetInterpreterNodeListImpl(TVMRetValue *rv, const mera::interpreter::Interpreter_ *impl);
 
 }  // namespace runtime
 }  // namespace tvm
 
-#endif  // TVM_RUNTIME_CONTRIB_EC_EC_RUNTIME_H_
+#endif  // TVM_RUNTIME_CONTRIB_MERA_QUANTIZER_RUNTIME_H_

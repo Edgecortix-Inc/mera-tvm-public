@@ -28,41 +28,25 @@
 #include <functional>
 #include <unordered_map>
 
+#include "mera_compiler_config.h"
 #include "utils.h"
 #include "../../utils.h"
 
 namespace tvm::relay::contrib {
 
-struct MeraCompilerConfigNode : public tvm::AttrsNode<MeraCompilerConfigNode> {
-  String input_layout;
-  String weight_layout;
-  String mera_ccfg;
-  String mera_arch;
-
-  TVM_DECLARE_ATTRS(MeraCompilerConfigNode, "ext.attrs.MeraCompilerConfigNode") {
-    TVM_ATTR_FIELD(input_layout).set_default("NHWC");
-    TVM_ATTR_FIELD(weight_layout).set_default("OIHW");
-    TVM_ATTR_FIELD(mera_ccfg).set_default("");
-    TVM_ATTR_FIELD(mera_arch).set_default("");
-  }
-};
-
-class MeraCompilerConfig : public Attrs {
- public:
-  TVM_DEFINE_NOTNULLABLE_OBJECT_REF_METHODS(MeraCompilerConfig, Attrs, MeraCompilerConfigNode);
-};
-
-MeraCompilerConfig GetMeraCompilerConfig();
 
 using TensorVec_t = std::vector<mera::ir::Tensor>;
 using Scope_t = std::map<std::string, mera::ir::Tensor>;
 
+typedef enum {COPY, WEIGHT_SWAP_LAYOUT} constant_parse_mode_t;
+
 class IRContext {
-  backend::MemoizedExprTranslator<TensorVec_t> &visitor;
+  using MemoVisitor = backend::MemoizedExprTranslator<TensorVec_t>;
+  MemoVisitor *visitor;
   const CallNode *root_call;
 
 public:
-  IRContext(backend::MemoizedExprTranslator<TensorVec_t> &visitor, const CallNode *root_call):
+  IRContext(MemoVisitor *visitor, const CallNode *root_call):
     visitor(visitor), root_call(root_call) {}
 
   /**
@@ -70,14 +54,17 @@ public:
    */
   class IRTraverse {
     const CallNode *curr_ir_pos;
-    const IRContext &owner;
+    IRContext &owner;
   public:
-    IRTraverse(const CallNode *pos, const IRContext &owner): curr_ir_pos(pos), owner(owner) {}
+    IRTraverse() = delete;
+    IRTraverse(const CallNode *pos, IRContext &owner): curr_ir_pos(pos), owner(owner) {}
 
     /**
      * @brief Move up the IR Call stack through argument 'index' of current position.
      */
     IRTraverse Get(unsigned index);
+
+    bool HasCall(unsigned index);
 
     /**
      * @brief Traverses the IR upstream via 'index' if the current IR position is of operation
@@ -95,19 +82,19 @@ public:
      * @brief Generates the MERA constant node attached to argument 'arg_index' of the current IR position.
      * TVM constants are embedded inside the composite call so they never are inputs to the composite.
      */
-    mera::ir::Tensor CompileConstant(unsigned arg_index) const;
+    mera::ir::Tensor CompileConstant(unsigned arg_index, constant_parse_mode_t parse_mode = COPY) const;
   };
 
   /**
    * @brief Starts an IR traversal through the root call of this composite.
    */
-  inline IRTraverse Traverse() const { return IRTraverse(root_call, *this); }
+  inline IRTraverse Traverse() { return IRTraverse(root_call, *this); }
 
   inline const CallNode *GetRootCall() const { return root_call; }
 };
 
 class MeraCompilerBase {
-  using CodeGenFunc_t = std::function<TensorVec_t(const TensorVec_t &, const IRContext &)>;
+  using CodeGenFunc_t = std::function<TensorVec_t(const TensorVec_t &, IRContext &)>;
   friend class MeraCompilerVisitor;
 
 protected:

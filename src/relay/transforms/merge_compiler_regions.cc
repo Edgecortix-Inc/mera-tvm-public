@@ -33,6 +33,7 @@
 #include <tvm/ir/error.h>
 #include <tvm/relay/analysis.h>
 #include <tvm/relay/attrs/annotation.h>
+#include <tvm/relay/attrs/nn.h>
 #include <tvm/relay/expr.h>
 #include <tvm/relay/expr_functor.h>
 #include <tvm/relay/transform.h>
@@ -161,17 +162,263 @@ class MergeAnnotations : public ExprRewriter {
   AnnotatedRegionSet regions_;
 };
 
+class NetworkExtractor : public ExprVisitor {
+ public:
+  explicit NetworkExtractor() {}
+
+  Array<Expr> Extract(const Expr& expr) {
+    networks_.clear();
+    const auto& expr_body = expr.as<FunctionNode>()->body;
+    // The last node in expr_body is always compiler_end annotation
+    if (expr_body.as<CallNode>()->args[0].as<CallNode>()
+        && expr_body.as<CallNode>()->args[0].as<CallNode>()->op == Op::Get("annotation.tuple_multi_networks")) {
+      // Multiple networks
+      VisitExpr(expr);
+    } else {
+      // A single network
+      networks_.push_back(expr_body);
+    }
+    return networks_;
+  }
+
+ private:
+  void VisitExpr_(const TupleNode* tuple) final {
+    for (const auto& field : tuple->fields) {
+      networks_.push_back(field);
+    }
+  }
+
+  Array<Expr> networks_;
+};
+
+class TopoSorter {
+ public:
+  TopoSorter(const std::map<AnnotatedRegion, std::vector<AnnotatedRegion> >& adjlist) {
+    adjlist_ = adjlist;
+    visited_.clear();
+    order_.clear();
+  }
+
+  void dfs(const AnnotatedRegion& src) {
+    visited_[src] = true;
+    for (const auto& dst : adjlist_[src]) {
+      if (!visited_[dst])
+        dfs(dst);
+    }
+    order_.push_front(src);
+  }
+
+  std::list<AnnotatedRegion> toposort() {
+    for (const auto& x : adjlist_) {
+      const AnnotatedRegion& src = x.first;
+      if (!visited_[src]) {
+        dfs(src);
+      }
+    }
+    return order_;
+  }
+
+ private:
+  std::map<AnnotatedRegion, std::vector<AnnotatedRegion> > adjlist_;
+  std::map<AnnotatedRegion, bool> visited_;
+  std::list<AnnotatedRegion> order_;
+};
+
+std::vector<AnnotatedRegion> toposort_subgraphs(const AnnotatedRegionSet& region_set) {
+  std::vector<AnnotatedRegion> subgraphs;
+  for (const auto& region : region_set) subgraphs.push_back(region);
+
+  // Get the children of each subgraph
+  std::map<AnnotatedRegion, std::vector<AnnotatedRegion> > children;
+  for (const auto& src : subgraphs) {
+    for (const auto& dst : subgraphs) {
+      for (const auto& src_in : src->GetInputs()) {
+        bool found = false;
+        if (src_in.as<CallNode>()) {
+          const auto& dst_outs = dst->GetOutputs();
+          found = (std::find(dst_outs.begin(), dst_outs.end(), src_in.as<CallNode>()->args[0]) != dst_outs.end());
+        }
+        if (found) {
+          children[src].push_back(dst);
+          break;
+        }
+      }
+    }
+  }
+
+  // Topological sort the subgraphs
+  TopoSorter sorter(children);
+  std::list<AnnotatedRegion> sorted_subgraphs = sorter.toposort();
+
+  // Return the non-default subgraphs
+  std::vector<AnnotatedRegion> outs;
+  for (const auto& subgraph : sorted_subgraphs) {
+    if (subgraph->GetTarget() != "default") {
+      outs.push_back(subgraph);
+    }
+  }
+  return outs;
+}
+
+std::vector<std::vector<Expr>> merge_region_sets(const Array<AnnotatedRegionSet>& region_sets) {
+  int num_networks = region_sets.size();
+
+  // Get the non-default subgraphs in each region_set and sort them
+  std::vector<AnnotatedRegion> subgraphs[num_networks];
+  int subgraph_counts[num_networks];
+  for (int i = 0; i < num_networks; i++) {
+    subgraphs[i] = toposort_subgraphs(region_sets[i]);
+    subgraph_counts[i] = subgraphs[i].size();
+  }
+
+  // Find the region_set that has the min number of non-default subgraphs
+  int id = 0;
+  for (int i = 1; i < num_networks; i++) {
+    if (subgraph_counts[i] < subgraph_counts[id]) {
+      id = i;
+    }
+  }
+  int min_subgraph_count = subgraph_counts[id];
+
+  // Merge region_sets
+  std::vector<std::vector<Expr>> to_be_merged;
+  for (int c = 0; c < min_subgraph_count; c++) {
+    std::vector<Expr> exprs;
+    for (int i = 0; i < num_networks; i++) {
+      const auto& region = subgraphs[i][c];
+      for (const auto& expr : region->GetOutputs()) {
+        exprs.push_back(expr);
+      }
+    }
+    to_be_merged.push_back(exprs);
+  }
+
+  return to_be_merged;
+}
+
+static const PackedFunc* make_begin_op =
+    runtime::Registry::Get("relay.op.annotation._make.compiler_begin");
+
+static const PackedFunc* make_end_op =
+    runtime::Registry::Get("relay.op.annotation._make.compiler_end");
+
+class TupleInserter : public ExprRewriter {
+ public:
+  explicit TupleInserter(std::vector<Expr> exprs) : exprs_(exprs) {}
+
+  Expr Rewrite_(const CallNode* call, const Expr& post) final {
+    if (call->op == CompilerEndOp()) {
+      for (size_t i = 0; i < exprs_.size(); i++) {
+        if (call == exprs_[i].as<CallNode>()) {
+          // Create the tuple node if it has not been created
+          if (!tuple_.as<TupleNode>()) {
+            Array<Expr> fields;
+            for (const auto& expr : exprs_) {
+              fields.push_back(expr.as<CallNode>()->args[0]);
+            }
+            tuple_ = Tuple(fields);
+          }
+          // Create TupleGetItem
+          auto tuple_get_item = TupleGetItem(tuple_, i);
+          std::string target = call->attrs.as<CompilerAttrs>()->compiler;
+          auto out = (*make_end_op)(tuple_get_item, target);
+          // Set a boundary at the split point so that RegionMerger works correctly
+          // auto out_1 = (*make_begin_op)(out, "default");
+          // auto out_2 = (*make_end_op)(out_1, "default");
+          return out;
+        }
+      }
+    }
+    return post;
+  }
+
+ private:
+  std::vector<Expr> exprs_;
+  Expr tuple_;
+};
+
+class ExprsBeforeConcatenateCollector : public ExprVisitor {
+ public:
+  explicit ExprsBeforeConcatenateCollector() {}
+
+  std::unordered_set<Expr, ObjectPtrHash, ObjectPtrEqual> collect(const Expr& expr) {
+    exprs_before_concatenate_.clear();
+    VisitExpr(expr);
+    return exprs_before_concatenate_;
+  }
+
+ private:
+  void VisitExpr_(const CallNode* call) final {
+    if (call->op == Op::Get("concatenate")) {
+      const TupleNode* tuple = call->args[0].as<CallNode>()->args[0].as<CallNode>()->args[0].as<TupleNode>();
+      for (const auto& field : tuple->fields) {
+        exprs_before_concatenate_.insert(field.as<CallNode>()->args[0].as<CallNode>()->args[0]);
+      }
+    }
+    ExprVisitor::VisitExpr_(call);
+  }
+
+  std::unordered_set<Expr, ObjectPtrHash, ObjectPtrEqual> exprs_before_concatenate_;
+};
+
 Expr MergeCompilerRegions(const Expr& expr) {
-  // Create regions using the annotations.
-  AnnotatedRegionSet regions = AnnotatedRegionSet::Create(expr, CompilerBeginOp(), CompilerEndOp());
+  // Extract the networks
+  NetworkExtractor extractor;
+  Array<Expr> networks = extractor.Extract(expr);
+  int num_networks = networks.size();
 
-  // Analyze the graph to explore the opportunities of merging regions.
-  RegionMerger merger(regions);
-  merger.VisitExpr(expr);
+  // Merge regions within each network
+  Array<AnnotatedRegionSet> region_sets;
+  for (int i = 0; i < num_networks; i++) {
+    Expr network = networks[i];
+    AnnotatedRegionSet region_set = AnnotatedRegionSet::Create(network, CompilerBeginOp(), CompilerEndOp());
+    RegionMerger merger(region_set);
+    merger.VisitExpr(network);
+    region_sets.push_back(region_set);
+  }
 
-  // Remove annotations that are not in the region boundaries.
-  MergeAnnotations merge_anno(regions);
-  return PostOrderRewrite(expr, &merge_anno);
+  // Group the networks
+  Expr out;
+  if (num_networks > 1) {
+    Array<Expr> fields;
+    for (int i = 0; i < num_networks; i++) {
+      fields.push_back(networks[i]);
+    }
+    out = Tuple(fields);
+  } else {
+    out = networks[0];
+  }
+
+  // Merge independent regions from different networks
+  if (num_networks > 1) {
+    std::vector<std::vector<Expr>> to_be_merged = merge_region_sets(region_sets);
+    // remove duplicate exprs before concatenate
+    ExprsBeforeConcatenateCollector collector;
+    std::unordered_set<Expr, ObjectPtrHash, ObjectPtrEqual> exprs_before_concatenate = collector.collect(out);
+    for (size_t i = 0; i < to_be_merged.size(); i++) {
+      std::vector<Expr>& exprs = to_be_merged[i];
+      exprs.erase(std::remove_if(exprs.begin(),
+                                 exprs.end(),
+                                 [&](Expr x){return exprs_before_concatenate.count(x.as<CallNode>()->args[0]) > 0;}),
+                  exprs.end());
+    }
+
+    for (size_t i = 0; i < to_be_merged.size(); i++) {
+      TupleInserter inserter(to_be_merged[i]);
+      out = PostOrderRewrite(out, &inserter);
+    }
+  }
+
+  // Remove annotations that are not in the region boundaries
+  AnnotatedRegionSet region_set = AnnotatedRegionSet::Create(out, CompilerBeginOp(), CompilerEndOp());
+  RegionMerger merger(region_set);
+  merger.VisitExpr(out);
+  MergeAnnotations merge_anno(region_set);
+  out = PostOrderRewrite(out, &merge_anno);
+
+  // Return the updated function
+  auto func = GetRef<Function>(expr.as<FunctionNode>());
+  return Function(func->params, out, func->ret_type, func->type_params, func->attrs);
 }
 
 }  // namespace merge_compiler_region

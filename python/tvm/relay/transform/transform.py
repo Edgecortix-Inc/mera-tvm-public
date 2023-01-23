@@ -1275,7 +1275,6 @@ def AnnotateSpans():
     return _ffi_api.AnnotateSpans()
 
 
-<<<<<<< HEAD
 # Mera specifc passes
 def SwapPadLayoutTransform():
     return _ffi_api.SwapPadLayoutTransform()
@@ -1293,10 +1292,7 @@ def InsertResize(new_in_height, new_in_width):
     return _ffi_api.InsertResize(new_in_height, new_in_width)
 
 
-def FakeQuantizationToInteger():
-=======
 def FakeQuantizationToInteger(hard_fail=False, use_qat=False):
->>>>>>> 178f82d
     # pylint: disable=anomalous-backslash-in-string
     """
     Find regions of the graph of the form

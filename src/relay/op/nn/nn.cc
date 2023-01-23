@@ -131,6 +131,7 @@ RELAY_REGISTER_OP("nn.bias_add")
     .set_support_level(1)
     .add_type_rel("BiasAdd", BiasAddRel)
     .set_attr<FInferCorrectLayout>("FInferCorrectLayout", BiasAddInferCorrectLayout)
+    .set_attr<TOpPattern>("TOpPattern", kBroadcast)
     .set_attr<FTVMCompute>("FTVMCompute", [](const Attrs& attrs, const Array<te::Tensor>& inputs,
                                              const Type& out_type) {
       const auto* param = attrs.as<BiasAddAttrs>();

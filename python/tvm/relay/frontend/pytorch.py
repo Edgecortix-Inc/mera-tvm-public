@@ -25,6 +25,7 @@ import functools
 import itertools
 import math
 import sys
+import logging
 
 import numpy as np
 import tvm
@@ -1089,7 +1090,7 @@ class PyTorchOpConverter:
         output_size = inputs[1]
 
         def func(x):
-            return _op.nn.adaptive_avg_pool2d(x, output_size=output_size, layout=self.layout)
+            return op(x, output_size=output_size, layout=self.layout)
 
         if self.is_quantized_tensor(data):
             return qnn_torch.apply_with_upcast(data, func)
@@ -1100,18 +1101,7 @@ class PyTorchOpConverter:
         data = inputs[0]
         output_size = inputs[1]
         # returns dummy indices too
-        return _op.nn.adaptive_max_pool2d(data, output_size=output_size, layout=self.layout), None
-
-    def adaptive_max_pool_3d(self, inputs, input_types):
-        data = inputs[0]
-        output_size = inputs[1]
-        # returns dummy indices too
-        return _op.nn.adaptive_max_pool3d(data, output_size=output_size), None
-
-    def adaptive_avg_pool_3d(self, inputs, input_types):
-        data = inputs[0]
-        output_size = inputs[1]
-        return _op.nn.adaptive_avg_pool3d(data, output_size=output_size)
+        return op(data, output_size=output_size, layout=self.layout), None
 
     @staticmethod
     def convert_const_list(data):
@@ -2006,55 +1996,61 @@ class PyTorchOpConverter:
     def none(self, inputs, input_types):
         return None
 
-    def make_pad(self, mode):
-        def pad(inputs, input_types):
-            data = inputs[0]
-            if isinstance(inputs[1], list):
-                pad_list = inputs[1]
-            else:
-                pad_list = list(self.infer_shape(inputs[1]))
+    def pad_common(self, mode, pad_value, inputs, input_types):
+        data = inputs[0]
+        if isinstance(inputs[1], list):
+            pad_list = inputs[1]
+        else:
+            pad_list = list(self.infer_shape(inputs[1]))
 
-            # initialize paddings based on input len
-            pad_len = len(self.infer_shape(data)) * 2
-            paddings = [0] * pad_len
+        # initialize paddings based on input len
+        pad_len = len(self.infer_shape(data)) * 2
+        paddings = [0] * pad_len
 
-            assert self.layout == 'NCHW' or self.layout == 'NHWC', "Only NCHW or NHWC layout are supported"
-            if self.layout == 'NCHW':
-                if len(pad_list) >= 2:
-                    paddings[-1] = pad_list[1]
-                    paddings[-2] = pad_list[0]
-                if len(pad_list) >= 4:
-                    paddings[-3] = pad_list[3]
-                    paddings[-4] = pad_list[2]
-                if len(pad_list) >= 6:
-                    paddings[-5] = pad_list[5]
-                    paddings[-6] = pad_list[4]
-            else: # NHWC
-                if len(pad_list) >= 2:
-                    paddings[-3] = pad_list[1]
-                    paddings[-4] = pad_list[0]
-                if len(pad_list) >= 4:
-                    paddings[-5] = pad_list[3]
-                    paddings[-6] = pad_list[2]
-                if len(pad_list) >= 6:
-                    paddings[-1] = pad_list[5]
-                    paddings[-2] = pad_list[4]
+        assert self.layout == 'NCHW' or self.layout == 'NHWC', "Only NCHW or NHWC layout are supported"
+        if self.layout == 'NCHW':
+            if len(pad_list) >= 2:
+                paddings[-1] = pad_list[1]
+                paddings[-2] = pad_list[0]
+            if len(pad_list) >= 4:
+                paddings[-3] = pad_list[3]
+                paddings[-4] = pad_list[2]
+            if len(pad_list) >= 6:
+                paddings[-5] = pad_list[5]
+                paddings[-6] = pad_list[4]
+        else: # NHWC
+            if len(pad_list) >= 2:
+                paddings[-3] = pad_list[1]
+                paddings[-4] = pad_list[0]
+            if len(pad_list) >= 4:
+                paddings[-5] = pad_list[3]
+                paddings[-6] = pad_list[2]
+            if len(pad_list) >= 6:
+                paddings[-1] = pad_list[5]
+                paddings[-2] = pad_list[4]
 
-            # group into tuple of 2 ints
-            paddings = [paddings[i : i + 2] for i in range(0, len(paddings), 2)]
+        # group into tuple of 2 ints
+        paddings = [paddings[i : i + 2] for i in range(0, len(paddings), 2)]
 
-            const_paddings = []
-            for pad in paddings:
-                const_paddings.append([])
-                for p in pad:
-                    if not isinstance(p, int):
-                        p = int(_infer_value(p, {}).numpy())
-                    const_paddings[-1].append(p)
+        const_paddings = []
+        non_zero_found = False
+        for pad in paddings:
+            const_paddings.append([])
+            for p in pad:
+                if isinstance(p, _expr.Expr):
+                    p = int(_infer_value(p, {}).numpy())
+                elif not isinstance(p, int):
+                    raise NotImplementedError("pad width should be int/expr")
+                const_paddings[-1].append(p)
+                if p != 0:
+                    non_zero_found = True
 
-            if mode == "constant":
-                return _op.nn.pad(data, const_paddings, pad_value=inputs[2], pad_mode=mode)
-            else:
-                return _op.nn.pad(data, const_paddings, pad_mode=mode)
+        if not non_zero_found:
+            return data
+        elif mode == "constant":
+            return _op.nn.pad(data, const_paddings, pad_value=pad_value, pad_mode=mode)
+        else:
+            return _op.nn.pad(data, const_paddings, pad_mode=mode)
 
     def pad(self, inputs, input_types):
         # mode: Optional default "constant"
@@ -2198,7 +2194,7 @@ class PyTorchOpConverter:
 
             def func(x):
                 return _op.image.resize2d(
-                    x, out_size, self.layout, method, coord_trans, cubic_alpha=-0.75
+                    x, out_size, None, self.layout, method, coord_trans, cubic_alpha=-0.75
                 )
 
             if self.is_quantized_tensor(data):
@@ -4560,7 +4556,6 @@ def from_pytorch(
     default_dtype="float32",
     layout="NCHW",
     use_parser_friendly_name=False,
-    keep_quantized_weight=False,
 ):
     """Load PyTorch model in the form of a scripted PyTorch model and convert into relay.
     The companion parameters will be handled automatically.
@@ -4592,16 +4587,6 @@ def from_pytorch(
         The Relay text parser treats a variable name followed by a period as a tuple element access,
         so a variable name like "dense.weight" cannot be parsed correctly.
         Use this option when you want to run the AnnotateSpans pass on the imported module.
-
-    keep_quantized_weight : bool
-        Return quantized weights and bias, rather than float ones. PyTorch stores quantized weights
-        in a custom format, so we cannot directly access 8 bit weights as Numpy arrays. We use
-        a PyTorch function to unpack quantized weights into float32 arrays and quantization
-        parameters. By default, we return float32 weights and rely on the QNN lowering and the
-        Relay constant folding pass to quantize weights at compile time. In BYOC use cases, however,
-        we cannot apply the constant folding pass on a QNN graph. If keep_quantized_weight is True,
-        we quantize weights in the frontend using a function that is equivalent to
-        qnn.op.quantize(...) operating on Numpy arrays.
 
     Returns
     -------
@@ -4655,18 +4640,10 @@ def from_pytorch(
     # For quantized models
     quantized_ops = set(["aten::quantize_per_tensor", "quantized::linear_dynamic"])
     if len(quantized_ops.intersection(set(op_names))) > 0:
-        weight_quant_params = qnn_torch.get_weight_quant_params(
-            script_module, packed_param_map.values()
-        )
+        weight_quant_params = qnn_torch.get_weight_quant_params(script_module)
         qnn_torch.inline_input_quant_params_for_fx(graph, tensors)
-        input_scales_for_bias = qnn_torch.add_input_quant_params_to_op_inputs(graph)
-        qnn_torch.add_quant_params_to_outputs(
-            outputs,
-            packed_param_map,
-            weight_quant_params,
-            input_scales_for_bias,
-            keep_quantized_weight,
-        )
+        qnn_torch.add_input_quant_params_to_op_inputs(graph)
+        qnn_torch.add_quant_params_to_outputs(outputs, packed_param_map, weight_quant_params)
         qnn_torch.add_quant_params(tvm_params, weight_quant_params)
         converter.update_convert_map(qnn_torch.get_convert_map(layout))
 

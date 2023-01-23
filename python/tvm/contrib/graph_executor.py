@@ -483,3 +483,21 @@ class GraphModule(object):
                 metric[k] = int(v)
             metrics.append(metric)
         return metrics
+
+    def _get_interpreter_buffer(self, buf_id) -> np.ndarray:
+        call = self.module["mera_get_interpreter_buffer"]
+        data = call(buf_id)
+        if not data:
+            raise ValueError(f'Could not find MERA interpreter buffer "{buf_id}" or runner is not an interpreter.')
+        return data.numpy()
+
+    def _get_interpreter_node_list(self):
+        import json
+        raw_data = json.loads(self.module["mera_get_interpreter_node_list"]())
+        data = {}
+        # Assemble list data
+        for sg in raw_data:
+            for d in sg:
+                if len(d) == 2:
+                    data[d[0]] = d[1]
+        return data

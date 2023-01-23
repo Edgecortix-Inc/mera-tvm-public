@@ -164,3 +164,20 @@ def compiler_end(data, compiler):
         The annotated expression.
     """
     return _make.compiler_end(data, compiler)
+
+
+def tuple_multi_networks(data):
+    """Annotate an expression to indicate that it is a tuple inserted to group the
+    outputs of multiple networks.
+
+    Parameters
+    ----------
+    data : tvm.relay.Expr
+        The expression to be annotated.
+
+    Returns
+    -------
+    result : tvm.relay.Expr
+        The annotated expression.
+    """
+    return _make.tuple_multi_networks(data)

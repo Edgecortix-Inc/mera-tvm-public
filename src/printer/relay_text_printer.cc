@@ -949,9 +949,9 @@ Doc RelayTextPrinter::PrintMapAsAttributeValue(const Map<ObjectRef, ObjectRef>& 
   std::vector<Doc> docs;
   for (const auto& k : map) {
     Doc doc;
-    if (k.second.defined()) {
-      doc << k.first << "=" << Print(k.second);
-    }
+    doc << PrintAttributeValue(k.first);
+    doc << "=";
+    doc << PrintAttributeValue(k.second);
     docs.push_back(doc);
   }
   Doc doc;

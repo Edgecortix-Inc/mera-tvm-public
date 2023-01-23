@@ -22,3 +22,4 @@ from .build_module import *
 from .version import *
 from .test_util import *
 from .relay_traversal import *
+from .quantize_module import *

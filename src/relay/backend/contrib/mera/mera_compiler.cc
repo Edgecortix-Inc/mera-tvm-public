@@ -24,6 +24,10 @@
 
 namespace tvm::relay::contrib {
 
+TVM_REGISTER_NODE_TYPE(MeraCompilerConfigNode);
+TVM_REGISTER_PASS_CONFIG_OPTION("relay.ext.mera.options", MeraCompilerConfig);
+TVM_REGISTER_NODE_TYPE(MeraQtzCompilerConfigNode);
+TVM_REGISTER_PASS_CONFIG_OPTION("relay.ext.mera_qtz.options", MeraQtzCompilerConfig);
 
 bool IRContext::IRTraverse::IsOp(const std::string &op_name) const {
   const auto *op_node = curr_ir_pos->op.as<OpNode>();
@@ -38,6 +42,11 @@ IRContext::IRTraverse IRContext::IRTraverse::Get(unsigned index) {
   return IRTraverse(new_pos, owner);
 }
 
+bool IRContext::IRTraverse::HasCall(unsigned index) {
+  CHECK(curr_ir_pos->args.size() > index);
+  return curr_ir_pos->args[index].as<CallNode>() != nullptr;
+}
+
 IRContext::IRTraverse IRContext::IRTraverse::MoveIf(const std::string &opt_op_name, unsigned index) {
   return IsOp(opt_op_name) ? Get(index) : *this;
 }
@@ -49,6 +58,11 @@ static inline mera::ir::Shape GetShapeNchw(const IRContext &ir) {
 MeraCompilerConfig GetMeraCompilerConfig() {
   auto cfg = transform::PassContext::Current()->GetConfig<MeraCompilerConfig>("relay.ext.mera.options");
   return cfg.value_or(AttrsWithDefaultValues<MeraCompilerConfig>());
+}
+
+MeraQtzCompilerConfig GetMeraQtzCompilerConfig() {
+  auto cfg = transform::PassContext::Current()->GetConfig<MeraQtzCompilerConfig>("relay.ext.mera_qtz.options");
+  return cfg.value_or(AttrsWithDefaultValues<MeraQtzCompilerConfig>());
 }
 
 struct Conv2DAttrValues {
@@ -96,27 +110,57 @@ struct MeraCompilerVisitor : public backend::MemoizedExprTranslator<TensorVec_t>
       << composite_name.value() << "' in the compiler.";
     const auto *call_body = func_call->body.as<CallNode>();
     CHECK_NOTNULL(call_body);
-    return it_func->second(input_tensors, IRContext(*this, call_body));
+    IRContext ir{this, call_body};
+    return it_func->second(input_tensors, ir);
   }
 
   TensorVec_t VisitExpr_(const VarNode* var) final {
     return {current_scope.at(var->name_hint())};
   }
 
+  template<typename T>
+  std::vector<T> ProcessConstant(void *data, mera::ir::Shape &shape) {
+    T *ptr = static_cast<T*>(data);
+    if (parse_mode == COPY) {
+      return std::vector<T>(ptr, ptr + shape.size);
+    } else if (parse_mode == WEIGHT_SWAP_LAYOUT) {
+      // Convert from HWIO to OIHW
+      CHECK_EQ(shape.rank, 4);
+      const auto H = shape.shape[0];
+      const auto W = shape.shape[1];
+      const auto I = shape.shape[2];
+      const auto O = shape.shape[3];
+      std::vector<T> ret(shape.size);
+      for (int o = 0; o < O; ++o) {
+        for (int i = 0; i < I; ++i) {
+          for (int h = 0; h < H; ++h) {
+            for (int w = 0; w < W; ++w) {
+              ret[w + h * W + i * H * W + o * I * H * W] =
+                ptr[o + i * O + w * I * O + h * I * O * W];
+            }
+          }
+        }
+      }
+      shape.shape = {O, I, H, W};
+      return ret;
+    } else {
+      LOG(FATAL) << "Unsupported constant parse mode " << parse_mode;
+    }
+    return {};
+  }
+
   TensorVec_t VisitExpr_(const ConstantNode* constant) final {
-    const auto shape = GetShape(constant->checked_type());
+    auto shape = GetShape(constant->checked_type());
     const auto mera_type = GetType(constant->checked_type());
+    void *constant_data = constant->data->data;
     if (mera_type == mera::ir::DataType::Float32) {
-      auto *ptr = static_cast<float*>(constant->data->data);
-      const std::vector<float> values(ptr, ptr + shape.size);
+      const std::vector<float> values = ProcessConstant<float>(constant_data, shape);
       return TensorVec_t{graph.Add<mera::ir::FloatVecConstant>("FloatConstant", mera_type, shape, values)};
     } else if (mera_type == mera::ir::DataType::Int32) {
-      auto *ptr = static_cast<int32_t*>(constant->data->data);
-      const std::vector<int32_t> values(ptr, ptr + shape.size);
+      const std::vector<int32_t> values = ProcessConstant<int32_t>(constant_data, shape);
       return TensorVec_t{graph.Add<mera::ir::Int32VecConstant>("Int32Constant", mera_type, shape, values)};
     } else if (mera_type == mera::ir::DataType::Int8 || mera_type == mera::ir::DataType::UInt8) {
-      auto *ptr = static_cast<int8_t*>(constant->data->data);
-      const std::vector<int8_t> values(ptr, ptr + shape.size);
+      const std::vector<int8_t> values = ProcessConstant<int8_t>(constant_data, shape);
       return TensorVec_t{graph.Add<mera::ir::Int8VecConstant>("Int8Constant", mera_type, shape, values)};
     } else {
       LOG(FATAL) << "Unsupported constant type";
@@ -138,6 +182,8 @@ struct MeraCompilerVisitor : public backend::MemoizedExprTranslator<TensorVec_t>
   const Scope_t& current_scope;
   mera::ir::Graph& graph;
 
+  constant_parse_mode_t parse_mode = COPY;
+
   MeraCompilerVisitor(MeraCompilerBase &compiler, const Scope_t &scope, mera::ir::Graph &graph):
     compiler(compiler), current_scope(scope), graph(graph) {}
 };
@@ -158,10 +204,15 @@ void MeraCompilerBase::Compile(const tvm::relay::Function &func) {
   graph_.AddOutput(visitor.VisitExpr(mod_main->body));
 }
 
-mera::ir::Tensor IRContext::IRTraverse::CompileConstant(unsigned arg_idx) const {
+mera::ir::Tensor IRContext::IRTraverse::CompileConstant(unsigned arg_idx, constant_parse_mode_t parse_mode) const {
   CHECK(curr_ir_pos->args.size() > arg_idx);
   CHECK_NOTNULL(curr_ir_pos->args[arg_idx].as<ConstantNode>());
-  auto tensors = owner.visitor.VisitExpr(curr_ir_pos->args[arg_idx]);
+
+  auto *visitor = dynamic_cast<MeraCompilerVisitor*>(owner.visitor);
+  CHECK_NOTNULL(visitor);
+  visitor->parse_mode = parse_mode;
+  auto tensors = visitor->VisitExpr(curr_ir_pos->args[arg_idx]);
+  visitor->parse_mode = COPY;
   CHECK_EQ(tensors.size(), 1);
   return tensors[0];
 }
@@ -172,51 +223,107 @@ mera::ir::Tensor IRContext::IRTraverse::CompileConstant(unsigned arg_idx) const 
 
 MeraFp32Compiler::MeraFp32Compiler(const std::string &id, mera::ir::Module &module):
   MeraCompilerBase(id, module, {
-    {"mera_fp32.conv2d", [&](const auto &inputs, const auto &ir) {
+    {"mera_fp32.conv2d", [&](const auto &inputs, auto &ir) {
       CHECK_EQ(inputs.size(), 1);
       const auto attr = GetConv2DAttrValues(ir.GetRootCall());
-      const auto weight = ir.Traverse().CompileConstant(1);
+      const auto weight = ir.Traverse().CompileConstant(1, WEIGHT_SWAP_LAYOUT);
       return TensorVec_t{graph_.Add<mera::ir::Conv2d>("Conv2d", kType, GetShapeNchw(ir),
         attr.dilations, attr.pads, attr.strides, attr.groups,
         attr.output_channels, inputs[0], weight)};
     }},
-    {"mera_fp32.bias_add", [&](const auto &inputs, const auto &ir) {
+    {"mera_fp32.bias_add", [&](const auto &inputs, auto &ir) {
       CHECK_EQ(inputs.size(), 1);
       const auto bias = ir.Traverse().CompileConstant(1);
       return TensorVec_t{graph_.Add<mera::ir::BiasAdd>("BiasAdd", kType, GetShapeNchw(ir),
         inputs[0], bias)};
     }},
-    {"mera_fp32.relu", [&](const auto &inputs, const auto &ir) {
+    {"mera_fp32.relu", [&](const auto &inputs, auto &ir) {
       CHECK_EQ(inputs.size(), 1);
       return TensorVec_t{graph_.Add<mera::ir::ReLU>("ReLU", kType, GetShapeNchw(ir), inputs[0])};
     }},
-    {"mera_fp32.maxpool2d", [&](const auto &inputs, const auto &ir) {
+    {"mera_fp32.leaky_relu", [&](const auto &inputs, auto &ir) {
+      CHECK_EQ(inputs.size(), 1);
+      const auto *attr = AsChecked<LeakyReluAttrs>(ir.GetRootCall()->attrs);
+      return TensorVec_t{graph_.Add<mera::ir::LeakyReLUFp>("LeakyReLU", kType, GetShapeNchw(ir), inputs[0], attr->alpha)};
+    }},
+    {"mera_fp32.silu", [&](const auto &inputs, auto &ir) {
+      CHECK_EQ(inputs.size(), 1);
+      return TensorVec_t{graph_.Add<mera::ir::SiLUFp>("SiLU", kType, GetShapeNchw(ir), inputs[0])};
+    }},
+    {"mera_fp32.hswish", [&](const auto &inputs, auto &ir) {
+      CHECK_EQ(inputs.size(), 1);
+      return TensorVec_t{graph_.Add<mera::ir::HSwishFp>("HSwish", kType, GetShapeNchw(ir), inputs[0])};
+    }},
+    {"mera_fp32.hswish_onnx", [&](const auto &inputs, auto &ir) {
+      CHECK_EQ(inputs.size(), 1);
+      return TensorVec_t{graph_.Add<mera::ir::HSwishFp>("HSwish", kType, GetShapeNchw(ir), inputs[0])};
+    }},
+    {"mera_fp32.maxpool2d", [&](const auto &inputs, auto &ir) {
       CHECK_EQ(inputs.size(), 1);
       const auto *attr = AsChecked<MaxPool2DAttrs>(ir.GetRootCall()->attrs);
       const int pool_h = GetInt(attr->pool_size[0]);
       const int pool_w = GetInt(attr->pool_size[1]);
-      return TensorVec_t{graph_.Add<mera::ir::MaxPool2d>("MaxPool2d", kType, GetShapeNchw(ir), inputs[0],
-        pool_h, pool_w, AttrToMeraStrides(attr->strides), AttrToMeraPadding(attr->padding))};
+      auto strides = AttrToMeraStrides(attr->strides);
+      auto pad = AttrToMeraPadding(attr->padding);
+      const auto out_shape = GetShapeNchw(ir);
+
+      if (ir.Traverse().HasCall(0) && ir.Traverse()[0].IsOp("nn.pad")) {
+        // Has explicit padding
+        const auto *pad_attr = AsChecked<PadAttrs>(ir.Traverse()[0].GetCall()->attrs);
+        pad.top += GetInt(pad_attr->pad_width[1][0]);
+        pad.bottom += GetInt(pad_attr->pad_width[1][1]);
+        pad.left += GetInt(pad_attr->pad_width[2][0]);
+        pad.right += GetInt(pad_attr->pad_width[2][1]);
+      }
+
+      // Check if we need to add extra padding (when ceil_mode=True)
+      if (attr->ceil_mode) {
+        auto in_type = GetShapeNchw(ir.GetRootCall()->args[0]->checked_type());
+        const int i_h = in_type.shape[2];
+        const int i_w = in_type.shape[3];
+        int o_h = std::floor(static_cast<float>(i_h - pool_h + pad.top + pad.bottom) / strides.h) + 1;
+        int o_w = std::floor(static_cast<float>(i_w - pool_w + pad.left + pad.right) / strides.w) + 1;
+        // Sanity check
+        CHECK_GE(out_shape.shape[2], o_h);
+        CHECK_GE(out_shape.shape[3], o_w);
+
+        // Add extra pad to right and bottom
+        pad.bottom += (out_shape.shape[2] - o_h);
+        pad.right += (out_shape.shape[3] - o_w);
+      }
+      return TensorVec_t{graph_.Add<mera::ir::MaxPool2d>("MaxPool2d", kType, out_shape, inputs[0],
+        pool_h, pool_w, strides, pad)};
     }},
-    {"mera_fp32.res_add", [&](const auto &inputs, const auto &ir) {
+    {"mera_fp32.res_add", [&](const auto &inputs, auto &ir) {
       CHECK_EQ(inputs.size(), 2);
       return TensorVec_t{graph_.Add<mera::ir::AddOp>("Add", kType, GetShapeNchw(ir), inputs[0], inputs[1])};
     }},
-    {"mera_fp32.avg_pool2d", [&](const auto &inputs, const auto &ir) {
+    {"mera_fp32.avg_pool2d", [&](const auto &inputs, auto &ir) {
       CHECK_EQ(inputs.size(), 1);
       return TensorVec_t{graph_.Add<mera::ir::AvgPooling2d>("AvgPooling2d", kType, GetShapeNchw(ir), inputs[0])};
     }},
-    {"mera_fp32.concatenate", [&](const auto &inputs, const auto &ir) {
+    {"mera_fp32.avg_pool2d_onnx", [&](const auto &inputs, auto &ir) {
+      CHECK_EQ(inputs.size(), 1);
+      return TensorVec_t{graph_.Add<mera::ir::AvgPooling2d>("AvgPooling2d", kType, GetShapeNchw(ir), inputs[0])};
+    }},
+    {"mera_fp32.concatenate", [&](const auto &inputs, auto &ir) {
       CHECK_GT(inputs.size(), 1);
       int axis = GetInt(AsChecked<ConcatenateAttrs>(ir.GetRootCall()->attrs)->axis);
       return TensorVec_t{graph_.Add<mera::ir::Concatenate>("Concatenate", kType, GetShapeNchw(ir), inputs, axis)};
     }},
-    {"mera_fp32.upsampling", [&](const auto &inputs, const auto &ir) {
+    {"mera_fp32.upsampling", [&](const auto &inputs, auto &ir) {
       CHECK_EQ(inputs.size(), 1);
       const auto attrs = AsChecked<Resize2DAttrs>(ir.GetRootCall()->attrs);
       return TensorVec_t{graph_.Add<mera::ir::UpsamplingFp>("Upsampling", kType, GetShapeNchw(ir), inputs[0],
         attrs->method, attrs->coordinate_transformation_mode)};
-    }}
+    }},
+    {"mera_fp32.hardtanh", [&](const auto &inputs, auto &ir) {
+      CHECK_EQ(inputs.size(), 1);
+      const auto *attr = AsChecked<ClipAttrs>(ir.GetRootCall()->attrs);
+      float clip_min = attr->a_min;
+      float clip_max = attr->a_max;
+      return TensorVec_t{graph_.Add<mera::ir::HardTanh>("HardTanh", kType, GetShapeNchw(ir), inputs[0], clip_min, clip_max)};
+    }},
   }) {};
 
 } // namespace tvm::relay::contrib

@@ -17,8 +17,9 @@
 import time
 import numpy as np
 
-from ..backend import compile_engine
-from ... import testing
+from ..backend import te_compiler
+# TODO: fix this import
+#from ... import testing
 from .. import transform
 from .build_module import build as ec_build
 from .build_module import load_runtime_module
@@ -42,6 +43,7 @@ def verify_output(ref_result, ec_result, tol=1e-5, quantized=True):
             print("Ref top5 label:", np.argsort(ref_result[0])[::-1][:5])
             print("EC top5 label:", np.argsort(ec_result[0])[::-1][:5])
     else:
+        # TODO: fix the "testing" import
         testing.assert_allclose(ec_result, ref_result, rtol=tol, atol=tol)
 
 
@@ -73,7 +75,7 @@ def run_and_verify(rt_mod, input_name, inp_np, ref_results=None, tol=1e-5, quant
 def run_mera_backend(
     script_module, inp_np, ref_results=None, layout="NCHW", output_dir="_out", aux_config={}
 ):
-    compile_engine.get().clear()
+    te_compiler.get().clear()
     input_name = "input0"
     input_shapes = [(input_name, inp_np.shape)]
     mod, params = from_pytorch(script_module, input_shapes, layout=layout)
@@ -87,7 +89,7 @@ def run_mera_backend(
 
 
 def run_tvm(script_module, inp_np):
-    compile_engine.get().clear()
+    te_compiler.get().clear()
     input_name = "input0"
     input_shapes = [(input_name, inp_np.shape)]
     mod, params = from_pytorch(script_module, input_shapes)

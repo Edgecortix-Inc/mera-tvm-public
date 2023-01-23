@@ -98,6 +98,61 @@ class ConstLoaderModuleNode : public ModuleNode {
         }
         *rv = metric_str.str();
       });
+    } else if (name == "mera_calculate_qparams") {
+      return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
+        std::stringstream qparam_raw;
+        qparam_raw << "[\n";
+        for (Module it : this->imports()) {
+          TVMRetValue it_ret;
+          auto pf = it.GetFunction("mera_calculate_qparams");
+          if (pf != nullptr) {
+            pf.CallPacked(args, &it_ret);
+            std::string qparam_mod = it_ret;
+            qparam_raw << qparam_mod << ",";
+          }
+        }
+        qparam_raw << "{}]";
+        *rv = qparam_raw.str();
+      });
+    } else if (name == "mera_quantizer_transform") {
+      return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
+        CHECK_EQ(args.num_args, 1);
+        const std::string mera_graph_name = args[0].operator std::string();
+        for (Module it : this->imports()) {
+          auto pf = it.GetFunction(mera_graph_name + "_transform");
+          if (pf != nullptr) {
+            pf.CallPacked(args, rv);
+            return;
+          }
+        }
+        *rv = NDArray::Empty({0}, DataType::UInt(8), {DLDeviceType::kDLCPU, 0});
+      });
+    } else if (name == "mera_get_interpreter_buffer") {
+      return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue *rv) {
+        CHECK_EQ(args.num_args, 1);
+        for (Module it : this->imports()) {
+          auto pf = it.GetFunction("mera_get_interpreter_buffer");
+          if (pf != nullptr) {
+            pf.CallPacked(args, rv);
+          }
+        }
+      });
+    } else if (name == "mera_get_interpreter_node_list") {
+      return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
+        std::stringstream nodelist_raw;
+        nodelist_raw << "[";
+        for (Module it : this->imports()) {
+          TVMRetValue it_ret;
+          auto pf = it.GetFunction("mera_get_interpreter_node_list");
+          if (pf != nullptr) {
+            pf.CallPacked(args, &it_ret);
+            std::string qparam_mod = it_ret;
+            nodelist_raw << qparam_mod << ",";
+          }
+        }
+        nodelist_raw << "[]]";
+        *rv = nodelist_raw.str();
+      });
     }
 
     for (Module it : this->imports()) {

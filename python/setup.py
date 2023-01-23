@@ -100,7 +100,6 @@ def git_describe_version(original_version):
 
 
 LIB_LIST, __version__ = get_lib_path()
-__version__ = git_describe_version(__version__)
 
 
 def config_cython():
@@ -203,26 +202,32 @@ _arch = 'aarch64' if _IS_ARM else 'x86'
 
 MERA_DNA_LIBS = glob.glob(f'{os.environ["MERA_HOME"]}/lib/libmeradna-{tvm_mode.name}.{_arch}*')
 
-# For bdist_wheel only
-if wheel_include_libs:
+if not CONDA_BUILD:
     with open("MANIFEST.in", "w") as fo:
         for path in LIB_LIST:
-            shutil.copy(path, os.path.join(CURRENT_DIR, "tvm"))
-            _, libname = os.path.split(path)
-            fo.write("include tvm/%s\n" % libname)
-        for path in MERA_DNA_LIBS:
-            shutil.copy(path, os.path.join(CURRENT_DIR, "tvm"))
-            fo.write(f"include tvm/{os.path.basename(path)}\n")
-        for pkg_data in get_package_data_files():
-            fo.write(f"include tvm/{pkg_data}\n")
-    setup_kwargs = {"include_package_data": True}
+            if os.path.isfile(path):
+                shutil.copy(path, os.path.join(CURRENT_DIR, "tvm"))
+                _, libname = os.path.split(path)
+                fo.write(f"include tvm/{libname}\n")
 
             if os.path.isdir(path):
                 _, libname = os.path.split(path)
                 shutil.copytree(path, os.path.join(CURRENT_DIR, "tvm", libname))
                 fo.write(f"recursive-include tvm/{libname} *\n")
+        for path in MERA_DNA_LIBS:
+            shutil.copy(path, os.path.join(CURRENT_DIR, "tvm"))
+            fo.write(f"include tvm/{os.path.basename(path)}\n")
+        for pkg_data in get_package_data_files():
+            fo.write(f"include tvm/{pkg_data}\n")
 
     setup_kwargs = {"include_package_data": True}
+
+
+#def long_description_contents():
+#    with open(pathlib.Path(CURRENT_DIR).resolve().parent / "README.md", encoding="utf-8") as readme:
+#        description = readme.read()
+#
+#    return description
 
 
 # Temporarily add this directory to the path so we can import the requirements generator
@@ -249,6 +254,7 @@ setup(
     name=PKG_NAME,
     version=mera_tvm_version,
     description="Mera TVM: An End to End Tensor IR/DSL Stack for Deep Learning Systems, adapted to Mera (https://github.com/Edgecortix-Inc/mera) environment.",
+    url="https://github.com/Edgecortix-Inc/mera-tvm-public",
     zip_safe=False,
     entry_points={"console_scripts": ["tvmc = tvm.driver.tvmc.main:main"]},
     install_requires=requirements["core"][1],
@@ -257,7 +263,6 @@ setup(
     package_dir={PKG_NAME: "tvm"},
     package_data={PKG_NAME: get_package_data_files()},
     distclass=BinaryDistribution,
-    url="https://github.com/Edgecortix-Inc/mera-tvm-public",
     ext_modules=config_cython(),
     **setup_kwargs,
 )
@@ -268,6 +273,13 @@ if not CONDA_BUILD:
     os.remove("MANIFEST.in")
     for path in LIB_LIST:
         _, libname = os.path.split(path)
-        os.remove("tvm/%s" % libname)
+        path_to_be_removed = f"tvm/{libname}"
+
+        if os.path.isfile(path_to_be_removed):
+            os.remove(path_to_be_removed)
+
+        if os.path.isdir(path_to_be_removed):
+            shutil.rmtree(path_to_be_removed)
+
     for path in MERA_DNA_LIBS:
         os.remove(f"tvm/{os.path.basename(path)}")
