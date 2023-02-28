@@ -226,8 +226,8 @@ REQUIREMENTS_BY_PIECE: RequirementsByPieceType = [
 ConstraintsType = typing.List[typing.Tuple[str, typing.Union[None, str]]]
 
 try:
-    from meratvm_internal import get_version as __mtvm_internal_v
-    MTVM_CURR_VERSION = "<=" + __mtvm_internal_v.get_version()
+    from meratvm_internal import __version__ as __mtvm_internal_v
+    MTVM_CURR_VERSION = "<=" + __mtvm_internal_v
 except:
     logging.warning(f'Could not find the current mera-tvm-internal version. Installation will not constrain it to any version.')
     MTVM_CURR_VERSION = None

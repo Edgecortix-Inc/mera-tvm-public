@@ -208,8 +208,7 @@ Tuple inserted to group the outputs of multiple networks.
     .set_num_inputs(1)
     .add_type_rel("Identity", IdentityRel)
     .set_attr<TOpPattern>("TOpPattern", kOpaque)
-    .set_attr<TOpIsStateful>("TOpIsStateful", false)
-    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", ElemwiseArbitraryLayout);
+    .set_attr<TOpIsStateful>("TOpIsStateful", false);
 
 TVM_REGISTER_GLOBAL("relay.op.annotation._make.tuple_multi_networks")
     .set_body_typed([](Expr data) {

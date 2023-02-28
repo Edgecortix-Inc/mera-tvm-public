@@ -349,7 +349,22 @@ class ExprsBeforeConcatenateCollector : public ExprVisitor {
 
  private:
   void VisitExpr_(const CallNode* call) final {
-    if (call->op == Op::Get("concatenate")) {
+    auto is_valid_concat = [](const CallNode *call) -> bool {
+      if (call && call->args.size()) {
+        const auto *ptr1 = call->args[0].as<CallNode>();
+        if (ptr1 && ptr1->args.size()) {
+          const auto *ptr2 = ptr1->args[0].as<CallNode>();
+          if (ptr2 && ptr2->args.size()) {
+            const auto *ptr3 = ptr2->args[0].as<TupleNode>();
+            if (ptr3) {
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    };
+    if (call->op == Op::Get("concatenate") && is_valid_concat(call)) {
       const TupleNode* tuple = call->args[0].as<CallNode>()->args[0].as<CallNode>()->args[0].as<TupleNode>();
       for (const auto& field : tuple->fields) {
         exprs_before_concatenate_.insert(field.as<CallNode>()->args[0].as<CallNode>()->args[0]);

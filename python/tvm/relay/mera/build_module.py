@@ -142,7 +142,7 @@ def build_config(**kwargs):
     return BuildConfig(**kwargs)
 
 
-def parse_config(cfg, use_interpreter):
+def parse_config(cfg):
     def _get_config_string(config, indent=0):
         ret = ""
         for k, v in config.items():
@@ -157,24 +157,20 @@ def parse_config(cfg, use_interpreter):
 
         return ret.rstrip()
     compiler_config_str = _get_config_string(cfg.compiler_config)
-    if not use_interpreter:
-        arch_cfg = cfg.arch_config
-        if isinstance(arch_cfg["arch"], dict):
-            # We are overriding arch config with custom values, serialize the contents directly so loader works correctly
-            arch_cfg = arch_cfg["arch"]
-        arch_config_str = _get_config_string(arch_cfg)
-    else:
-        arch_config_str = ''
+    arch_cfg = cfg.arch_config
+    if isinstance(arch_cfg["arch"], dict):
+        # We are overriding arch config with custom values, serialize the contents directly so loader works correctly
+        arch_cfg = arch_cfg["arch"]
+    arch_config_str = _get_config_string(arch_cfg)
     return compiler_config_str, arch_config_str
 
 
-def _set_config(cfg, use_interpreter):
-    compiler_config_str, arch_config_str = parse_config(cfg, use_interpreter)
+def _set_config(cfg):
+    compiler_config_str, arch_config_str = parse_config(cfg)
     mera_set_ccfg = get_global_func("relay.ext.mera.set_ccfg")
     mera_set_ccfg(compiler_config_str)
-    if not use_interpreter:
-        mera_set_arch = get_global_func("relay.ext.mera.set_arch")
-        mera_set_arch(arch_config_str)
+    mera_set_arch = get_global_func("relay.ext.mera.set_arch")
+    mera_set_arch(arch_config_str)
     return compiler_config_str, arch_config_str
 
 
@@ -195,7 +191,8 @@ class IsComputeIntensiveGraph(ExprVisitor):
                 "nn.adaptive_avg_pool2d",
                 "image.resize2d",
                 "mean",
-                "nn.conv2d"
+                "nn.conv2d",
+                "nn.conv2d_transpose"
             ]
         )
         if isinstance(call.op, tir.op.Op):
@@ -320,10 +317,8 @@ def _build_common(mod, params, target_tvm, fcompile, layout, output_dir, aux_con
     cfg = BuildConfig.current
     assert cfg.compiler_config["target"] is not None
 
-    use_interpreter = cfg.compiler_config["target"] in ["Interpreter", "InterpreterHw"]
-
     # TODO - Remove need to use API calls for set cfg
-    ccfg_str, arch_cfg_str = _set_config(cfg, use_interpreter)
+    ccfg_str, arch_cfg_str = _set_config(cfg)
 
     if aux_config["with_clip_pattern"]:
         pattern_table = get_pattern_table("mera_with_clip")
@@ -521,6 +516,7 @@ def __run_passes_core(mod, params, target, host_arch, c_cfg, arch_cfg, aux_confi
         # TVM wont be able to run it with that weight layout.
         desired_layouts = {
             'nn.conv2d': ["NHWC", 'HWIO'],
+            'nn.conv2d_transpose' : ['NHWC', 'HWIO'],
             'image.resize2d': ['NHWC'],
             'nn.max_pool2d': ['NHWC'],
             'nn.avg_pool2d': ['NHWC'],
@@ -599,7 +595,7 @@ def build_fp32(mod, params, target, host_arch="x86", output_dir = None):
         raise ValueError(f'Unsupported target for fp32 MERA deployment: {target}')
     cfg = BuildConfig()
     cfg.compiler_config['target'] = target
-    ccfg_str, _ = parse_config(cfg, True)
+    ccfg_str, _ = parse_config(cfg)
     json, lib, new_params, new_mod = __run_passes_core(mod, params, target, host_arch, ccfg_str, '', {}, "mera_fp32")
     if output_dir:
         # Export data to output dir

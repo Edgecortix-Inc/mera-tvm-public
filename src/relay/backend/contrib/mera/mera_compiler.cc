@@ -73,8 +73,9 @@ struct Conv2DAttrValues {
   mera::ir::Dilations dilations;
 };
 
+template<typename ConvAttrT = Conv2DAttrs>
 Conv2DAttrValues GetConv2DAttrValues(const CallNode *call) {
-  const auto attr = AsChecked<Conv2DAttrs>(call->attrs);
+  const auto attr = AsChecked<ConvAttrT>(call->attrs);
   Conv2DAttrValues res;
   res.groups = attr->groups;
   res.output_channels = GetInt(attr->channels);
@@ -178,6 +179,11 @@ struct MeraCompilerVisitor : public backend::MemoizedExprTranslator<TensorVec_t>
     return res;
   }
 
+  TensorVec_t VisitExpr_(const TupleGetItemNode* tup) final {
+    const auto* tuple = tup->tuple.as<TupleNode>();
+    return VisitExpr(tuple->fields[tup->index]);
+  }
+
   MeraCompilerBase &compiler;
   const Scope_t& current_scope;
   mera::ir::Graph& graph;
@@ -228,6 +234,14 @@ MeraFp32Compiler::MeraFp32Compiler(const std::string &id, mera::ir::Module &modu
       const auto attr = GetConv2DAttrValues(ir.GetRootCall());
       const auto weight = ir.Traverse().CompileConstant(1, WEIGHT_SWAP_LAYOUT);
       return TensorVec_t{graph_.Add<mera::ir::Conv2d>("Conv2d", kType, GetShapeNchw(ir),
+        attr.dilations, attr.pads, attr.strides, attr.groups,
+        attr.output_channels, inputs[0], weight)};
+    }},
+    {"mera_fp32.tconv2d", [&](const auto &inputs, auto &ir) {
+      CHECK_EQ(inputs.size(), 1);
+      const auto attr = GetConv2DAttrValues<Conv2DTransposeAttrs>(ir.GetRootCall());
+      const auto weight = ir.Traverse().CompileConstant(1, WEIGHT_SWAP_LAYOUT);
+      return TensorVec_t{graph_.Add<mera::ir::TransConv2d>("TransConv2d", kType, GetShapeNchw(ir),
         attr.dilations, attr.pads, attr.strides, attr.groups,
         attr.output_channels, inputs[0], weight)};
     }},
