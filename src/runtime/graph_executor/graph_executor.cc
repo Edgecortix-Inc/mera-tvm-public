@@ -664,11 +664,13 @@ PackedFunc GraphExecutor::GetFunction(const std::string& name,
       this->LoadParams(args[0].operator std::string());
     });
   } else if (name == "get_runtime_metrics"
+      || name == "get_power_metrics"
       || name == "mera_calculate_qparams"
       || name == "mera_quantizer_reset"
       || name == "mera_quantizer_transform"
       || name == "mera_get_interpreter_buffer"
-      || name == "mera_get_interpreter_node_list") {
+      || name == "mera_get_interpreter_node_list"
+      || name == "mera_runtime_init_device") {
     auto pf = module_.GetFunction(name, true);
     CHECK(pf != nullptr);
     return PackedFunc([sptr_to_self, pf](TVMArgs args, TVMRetValue* rv) { pf.CallPacked(args, rv); });

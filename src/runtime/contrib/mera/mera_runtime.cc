@@ -38,8 +38,8 @@ MeraRuntime::MeraRuntime(std::vector<uint8_t> code, bool interpreter, const std:
     : code_(code), interpreter_(interpreter), func_name_(func_name) {
 }
 
-void MeraRuntime::Init() {
-  mera_exec_ = mera::execute::CreateExecutor(code_);
+void MeraRuntime::Init(mera::execute::DeviceRunTarget device_run_target) {
+  mera_exec_ = mera::execute::CreateExecutor(code_, device_run_target);
 }
 
 void MeraRuntime::Invoke() {}
@@ -70,7 +70,11 @@ PackedFunc MeraRuntime::GetFunction(const std::string& name, const ObjectPtr<Obj
       this->Invoke();
     });
   } else if (name == "get_runtime_metrics") {
-    return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) { *rv = metrics_str_; });
+    return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
+      *rv = all_metrics_.AsString(mera::execute::ExecutorMetrics::MetricsType::RUNTIME); });
+  } else if (name == "get_power_metrics") {
+    return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
+      *rv = all_metrics_.AsString(mera::execute::ExecutorMetrics::MetricsType::POWER); });
   } else if (name == func_name_) {
     return PackedFunc([sptr_to_self, name, this](TVMArgs args, TVMRetValue* rv) {
       std::vector<void*> argument_data;
@@ -79,7 +83,7 @@ PackedFunc MeraRuntime::GetFunction(const std::string& name, const ObjectPtr<Obj
         CHECK(arg);
         argument_data.push_back(arg->data);
       }
-      metrics_str_ = mera::execute::Execute(mera_exec_.get(), name, argument_data).AsString();
+      all_metrics_ = mera::execute::Execute(mera_exec_.get(), name, argument_data);
     });
   } else if (name == "mera_get_interpreter_buffer") {
     return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
@@ -96,6 +100,14 @@ PackedFunc MeraRuntime::GetFunction(const std::string& name, const ObjectPtr<Obj
       CHECK_NOTNULL(int_ptr);
       GetInterpreterNodeListImpl(rv, int_ptr);
     });
+  } else if (name == "mera_runtime_init_device") {
+    return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
+      CHECK_EQ(args.num_args, 1);
+      int rt_target = static_cast<int>(args[0]);
+      auto runtime_target = static_cast<mera::execute::DeviceRunTarget>(rt_target);
+      //LOG(INFO) << "Init with " << runtime_target;
+      this->Init(runtime_target);
+    });
   } else {
     return PackedFunc();
   }
@@ -108,7 +120,7 @@ Module MeraRuntimeCreateEmpty(std::vector<uint8_t> code, bool interpreter, const
 
 Module MeraRuntimeCreate(std::vector<uint8_t> code, bool interpreter, const std::string& func_name) {
   auto exec = make_object<MeraRuntime>(code, interpreter, func_name);
-  exec->Init();
+  exec->Init(mera::execute::DeviceRunTarget::NONE);
   return Module(exec);
 }
 
@@ -123,7 +135,7 @@ Module LoadFromBinary(void* strm) {
   std::vector<uint8_t> code;
   code.resize(size);
   stream->ReadArray(code.data(), code.size());
-  return MeraRuntimeCreate(code, use_interpreter, func_name);
+  return MeraRuntimeCreateEmpty(code, use_interpreter, func_name);
 }
 
 void GetInterpreterBufferImpl(TVMRetValue *rv, const mera::interpreter::Interpreter_ *impl, const std::string &op_id) {
@@ -163,7 +175,73 @@ void GetInterpreterNodeListImpl(TVMRetValue *rv, const mera::interpreter::Interp
   *rv = ss.str();
 }
 
+template<typename B>
+std::unique_ptr<mera::blocks::MeraBlock> LoadMeraBlock(const std::vector<uint8_t> &params) {
+  std::unique_ptr<mera::blocks::MeraBlock> block{std::make_unique<B>()};
+  block->LoadParams(params);
+  return std::move(block);
+}
+
+std::unique_ptr<mera::blocks::MeraBlock> GetBlockImpl(const std::string &block_id, const std::vector<uint8_t> &params) {
+  if (block_id == mera::blocks::Yolov5Post::GetBlockId()) {
+    return std::move(LoadMeraBlock<mera::blocks::Yolov5Post>(params));
+  } else if (block_id == mera::blocks::Yolov5i8Post::GetBlockId()) {
+    return std::move(LoadMeraBlock<mera::blocks::Yolov5i8Post>(params));
+  } else {
+    LOG(FATAL) << "Unknown MeraBlock ID " << block_id;
+    return nullptr;
+  }
+}
+
+MeraBlocksRuntime::MeraBlocksRuntime(const std::string &func_name, const std::string &block_id,
+  const std::vector<uint8_t> &compiled_code): func_name_(func_name), block_id_(block_id), compiled_code_(compiled_code),
+  impl_ptr_(std::move(GetBlockImpl(block_id, compiled_code))) {}
+
+Module MeraBlocksCreate(const std::string &func_name, const std::string &block_id,
+  const std::vector<uint8_t> &compiled_code) {
+  return Module(make_object<MeraBlocksRuntime>(func_name, block_id, compiled_code));
+}
+
+void MeraBlocksRuntime::SaveToBinary(dmlc::Stream *stream) {
+  stream->Write(func_name_);
+  stream->Write(block_id_);
+  stream->Write(static_cast<uint64_t>(compiled_code_.size()));
+  stream->WriteArray(compiled_code_.data(), compiled_code_.size());
+}
+
+Module LoadFromBinaryBlocks(void *strm) {
+  dmlc::Stream* stream = static_cast<dmlc::Stream*>(strm);
+  std::string func_name;
+  stream->Read(&func_name);
+  std::string block_id;
+  stream->Read(&block_id);
+  uint64_t size;
+  stream->Read(&size);
+  std::vector<uint8_t> code(size);
+  stream->ReadArray(code.data(), size);
+  return MeraBlocksCreate(func_name, block_id, code);
+}
+
+PackedFunc MeraBlocksRuntime::GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self) {
+  if (name == func_name_) {
+    // Return func for executing the block
+    return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
+        CHECK_NOTNULL(impl_ptr_);
+        std::vector<void*> argument_data;
+        for (int i = 0; i < args.size(); i++) {
+          DLTensor* arg = static_cast<DLTensor*>(args[i]);
+          CHECK(arg);
+          argument_data.push_back(arg->data);
+        }
+        impl_ptr_->Evaluate(argument_data);
+    });
+  }
+  return PackedFunc();
+}
+
+
 TVM_REGISTER_GLOBAL("runtime.module.loadbinary_MeraRuntime").set_body_typed(LoadFromBinary);
+TVM_REGISTER_GLOBAL("runtime.module.loadbinary_MeraBlocksRuntime").set_body_typed(LoadFromBinaryBlocks);
 
 TVM_REGISTER_GLOBAL("runtime.module.get_version").set_body_typed([]() { return mera::GetMeradnaVersionStr(); });
 
@@ -177,6 +255,12 @@ TVM_REGISTER_GLOBAL("runtime.module.mera_module_create_empty")
 TVM_REGISTER_GLOBAL("runtime.module.loadfile_mera").set_body_typed([](DLTensor* code) {
   return MeraRuntimeCreate(std::vector<uint8_t>(), true, "");
 });
+
+TVM_REGISTER_GLOBAL("runtime.module.mera_blocks_module_create")
+  .set_body_typed([](const std::string &func_name, const std::string &block_id, DLTensor* code) {
+    auto* begin = reinterpret_cast<const uint8_t*>(code->data);
+    return MeraBlocksCreate(func_name, block_id, std::vector<uint8_t>(begin, begin + code->shape[0]));
+  });
 
 }  // namespace runtime
 }  // namespace tvm

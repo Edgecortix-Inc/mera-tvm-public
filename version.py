@@ -38,12 +38,12 @@ import subprocess
 # Current version:
 # We use the version of the incoming release for code
 # that is under development
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 # Most recent tag, used for git describe validation
 # set this value to be the most recent release tag
 # before this development cycle.
-__most_recent_tag__ = "v1.3.0"
+__most_recent_tag__ = "v1.3.1"
 # ---------------------------------------------------
 
 PROJ_ROOT = os.path.dirname(os.path.abspath(os.path.expanduser(__file__)))

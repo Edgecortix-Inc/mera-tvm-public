@@ -17,7 +17,7 @@
 # specific language governing permissions and limitations
 # under the License.
 # pylint: disable=wildcard-import
-from meratvm_internal import patterns
+from meratvm_internal import patterns, patterns_mera_blocks
 from .build_module import *
 from .version import *
 from .test_util import *

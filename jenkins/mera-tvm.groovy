@@ -27,7 +27,7 @@ def build(build_dir, jobs, libmeradna_name) {
     sh "mkdir -p ${build_dir}"
     sh """
         cd ${build_dir} && cmake -DUSE_OPENMP=gnu -DUSE_LLVM=ON -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DLIBMERADNA_NAME=${libmeradna_name} ..
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ..
         make -j ${jobs}
     """
 }
@@ -36,7 +36,7 @@ def buildRuntime(build_dir, jobs, libmeradna_name) {
     sh "mkdir -p ${build_dir}"
     sh """
         cd ${build_dir} && cmake -DUSE_OPENMP=gnu -DUSE_LLVM=OFF -DUSE_LIBBRACKTRACE=OFF -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DLIBMERADNA_NAME=${libmeradna_name} ..
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DMERADNA_RUNTIME_ONLY=ON ..
         make runtime -j ${jobs}
     """
 }

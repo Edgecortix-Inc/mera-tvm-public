@@ -21,7 +21,7 @@
 
 /*!
  * \brief Mera runtime containing only tvm PackedFunc.
- * \file ec_runtime.h
+ * \file mera_runtime.h
  */
 #ifndef TVM_RUNTIME_CONTRIB_EC_EC_RUNTIME_H_
 #define TVM_RUNTIME_CONTRIB_EC_EC_RUNTIME_H_
@@ -29,6 +29,7 @@
 #include <dlpack/dlpack.h>
 #include <mera/mdna_execute.h>
 #include <mera/mdna_interpreter.h>
+#include <mera/mdna_blocks.h>
 #include <tvm/runtime/ndarray.h>
 #include <tvm/runtime/packed_func.h>
 
@@ -75,19 +76,43 @@ class MeraRuntime : public ModuleNode {
   /*!
    * \brief Initialize the mera runtime with context.
    */
-  void Init();
+  void Init(mera::execute::DeviceRunTarget device_run_target);
 
  private:
   std::unique_ptr<mera::execute::Executor> mera_exec_;
   std::vector<uint8_t> code_;
   bool interpreter_;
   std::string func_name_;
-  std::string metrics_str_;
+  mera::execute::ExecutorMetrics all_metrics_;
 };
 
 void GetInterpreterBufferImpl(TVMRetValue *rv, const mera::interpreter::Interpreter_ *impl, const std::string &op_id);
 
 void GetInterpreterNodeListImpl(TVMRetValue *rv, const mera::interpreter::Interpreter_ *impl);
+
+/*!
+ * \brief MERA Blocks runtime.
+ *
+ *  This runtime can be accessed in various language via
+ *  TVM runtime PackedFunc API.
+ */
+class MeraBlocksRuntime : public ModuleNode {
+ public:
+  explicit MeraBlocksRuntime(const std::string &func_name, const std::string &block_id, const std::vector<uint8_t> &compiled_code);
+
+  std::string GetSource(const std::string&) { return ""; }
+
+  void SaveToBinary(dmlc::Stream *stream) final;
+
+  virtual PackedFunc GetFunction(const std::string &name, const ObjectPtr<Object> &sptr_to_self);
+
+  const char* type_key() const { return "MeraBlocksRuntime"; }
+ private:
+  std::string func_name_;
+  std::string block_id_;
+  std::vector<uint8_t> compiled_code_;
+  std::unique_ptr<mera::blocks::MeraBlock> impl_ptr_;
+};
 
 }  // namespace runtime
 }  // namespace tvm

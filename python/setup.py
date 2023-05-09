@@ -200,7 +200,11 @@ if not os.environ.get("MERA_HOME", None):
 _IS_ARM = any([bool(re.match(r"--plat-name=.*_aarch64", a)) for a in sys.argv])
 _arch = 'aarch64' if _IS_ARM else 'x86'
 
-MERA_DNA_LIBS = glob.glob(f'{os.environ["MERA_HOME"]}/lib/libmeradna-{tvm_mode.name}.{_arch}*')
+MERA_DNA_LIBS = glob.glob(f'{os.environ["MERA_HOME"]}/lib/libmeradna-{tvm_mode.name}.{_arch}.so')\
+    + glob.glob(f'{os.environ["MERA_HOME"]}/lib/libdna-ip-runtime-*.so')
+if tvm_mode.name != "runtime":
+    MERA_DNA_LIBS += glob.glob(f'{os.environ["MERA_HOME"]}/lib/libdna-ip-tr*.so')
+MERA_DNA_SYMLINK_LIBS = []
 
 if not CONDA_BUILD:
     with open("MANIFEST.in", "w") as fo:
@@ -215,8 +219,18 @@ if not CONDA_BUILD:
                 shutil.copytree(path, os.path.join(CURRENT_DIR, "tvm", libname))
                 fo.write(f"recursive-include tvm/{libname} *\n")
         for path in MERA_DNA_LIBS:
-            shutil.copy(path, os.path.join(CURRENT_DIR, "tvm"))
-            fo.write(f"include tvm/{os.path.basename(path)}\n")
+            if os.path.islink(path):
+                link_name = "tvm/" + os.path.basename(path)
+                MERA_DNA_SYMLINK_LIBS.append(link_name)
+                full_path = pathlib.Path(path).resolve()
+                MERA_DNA_SYMLINK_LIBS.append(os.path.join("tvm", os.path.basename(full_path)))
+                shutil.copy(full_path, os.path.join(CURRENT_DIR, "tvm"))
+                pathlib.Path(link_name).symlink_to(pathlib.Path(os.path.basename(full_path)))
+                fo.write(f"include tvm/{os.path.basename(full_path)}\n")
+                fo.write(f"include {link_name}\n")
+            else:
+                shutil.copy(path, os.path.join(CURRENT_DIR, "tvm"))
+                fo.write(f"include tvm/{os.path.basename(path)}\n")
         for pkg_data in get_package_data_files():
             fo.write(f"include tvm/{pkg_data}\n")
 
@@ -283,3 +297,6 @@ if not CONDA_BUILD:
 
     for path in MERA_DNA_LIBS:
         os.remove(f"tvm/{os.path.basename(path)}")
+    for path in MERA_DNA_SYMLINK_LIBS:
+        if pathlib.Path(path).exists():
+            os.remove(path)

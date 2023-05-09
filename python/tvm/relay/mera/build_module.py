@@ -363,8 +363,10 @@ def _build_common(mod, params, target_tvm, fcompile, layout, output_dir, aux_con
 
         pass_list = [
             transform.SimplifyInference(),
+            # [!] 'mera_blocks' pattern table must run before 'mera' qtz table.
+            transform.MergeComposite(get_pattern_table("mera_blocks")),
             transform.MergeComposite(pattern_table),
-            transform.AnnotateTarget("mera"),
+            transform.AnnotateTarget(["mera", "mera_blocks"]),
             transform.MergeCompilerRegions(),
             transform.PartitionGraph(),
             transform.InlineExternClip(),
@@ -376,9 +378,9 @@ def _build_common(mod, params, target_tvm, fcompile, layout, output_dir, aux_con
 
         composite_partition = Sequential(pass_list)
 
-        partitioned = composite_partition(mod)
-        pruned = prune_no_mac_subgraphs(partitioned)
-        report_captured_stats(gather_captured_stats_pass(pruned))
+        mod = composite_partition(mod)
+        mod = prune_no_mac_subgraphs(mod)
+        report_captured_stats(gather_captured_stats_pass(mod))
 
     input_layout = "NHWC"
     config = {
@@ -392,7 +394,7 @@ def _build_common(mod, params, target_tvm, fcompile, layout, output_dir, aux_con
 
     with PassContext(opt_level=3, disabled_pass=["AlterOpLayout"], config=config):
         try:
-            json, lib, all_params = _build(pruned, target=target_tvm, params=params)
+            json, lib, all_params = _build(mod, target=target_tvm, params=params)
         except TVMError as ex:
             raise MeraError(f"ERROR found during compilation of MERA model:\n'{str(ex)}'")\
                 .with_traceback(sys.exc_info()[2]) from ex
@@ -591,12 +593,12 @@ def __run_passes_core(mod, params, target, host_arch, c_cfg, arch_cfg, aux_confi
 
 def build_fp32(mod, params, target, host_arch="x86", output_dir = None):
     """Build in fp32 precision and NHWC/IOHW layout"""
-    if target not in ['Quantizer', 'Interpreter']:
+    if target not in ['Quantizer', 'Interpreter', 'InterpreterHwBf16']:
         raise ValueError(f'Unsupported target for fp32 MERA deployment: {target}')
     cfg = BuildConfig()
     cfg.compiler_config['target'] = target
-    ccfg_str, _ = parse_config(cfg)
-    json, lib, new_params, new_mod = __run_passes_core(mod, params, target, host_arch, ccfg_str, '', {}, "mera_fp32")
+    ccfg_str, arch_str = parse_config(cfg)
+    json, lib, new_params, new_mod = __run_passes_core(mod, params, target, host_arch, ccfg_str, arch_str, {}, "mera_fp32")
     if output_dir:
         # Export data to output dir
         if host_arch == "x86":

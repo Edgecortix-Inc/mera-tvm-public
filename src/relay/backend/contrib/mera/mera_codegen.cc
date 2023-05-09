@@ -861,12 +861,13 @@ runtime::Module CompileModuleFp32(const ObjectRef &ref) {
     const auto* pf = runtime::Registry::Get("runtime.module.mera_quantizer_create");
     CHECK_NOTNULL(pf);
     return (*pf)(&input, func_name);
-  } else {
-    CHECK_EQ(cdgen_cfg->mera_target, "Interpreter") << "Only Interpreter target allowed for fp32 MERA, not '"
-      << cdgen_cfg->mera_target << "'";
+  } else if (cdgen_cfg->mera_target == "Interpreter" || cdgen_cfg->mera_target == "InterpreterHwBf16") {
     const auto* pf = runtime::Registry::Get("runtime.module.mera_module_create_empty");
     CHECK_NOTNULL(pf);
     return (*pf)(&input, true, func_name);
+  } else {
+    CHECK(false) << "Unknown Interpreter target for fp32 MERA: '" << cdgen_cfg->mera_target << "'";
+    return runtime::Module{};
   }
 }
 

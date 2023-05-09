@@ -84,12 +84,12 @@ class ConstLoaderModuleNode : public ModuleNode {
     // symobl lookup overhead should be minimal.
     ICHECK(!this->imports().empty());
 
-    if (name == "get_runtime_metrics") {
-      return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
+    if (name == "get_runtime_metrics" || name == "get_power_metrics") {
+      return PackedFunc([sptr_to_self, this, name](TVMArgs args, TVMRetValue* rv) {
         std::stringstream metric_str;
         for (Module it : this->imports()) {
           TVMRetValue it_ret;
-          auto pf = it.GetFunction("get_runtime_metrics");
+          auto pf = it.GetFunction(name);
           if (pf != nullptr) {
             pf.CallPacked(args, &it_ret);
             std::string mod_metric = it_ret;
@@ -152,6 +152,16 @@ class ConstLoaderModuleNode : public ModuleNode {
         }
         nodelist_raw << "[]]";
         *rv = nodelist_raw.str();
+      });
+    } else if (name == "mera_runtime_init_device") {
+      return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
+        CHECK_EQ(args.num_args, 1);
+        for (Module it : this->imports()) {
+          auto pf = it.GetFunction("mera_runtime_init_device");
+          if (pf != nullptr) {
+            pf.CallPacked(args, rv);
+          }
+        }
       });
     }
 
