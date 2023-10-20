@@ -71,7 +71,38 @@ mera::ir::Shape GetShape(const Type& type) {
     shape.push_back(v->value);
     s *= v->value;
   }
-  return mera::ir::Shape{shape, int(shape.size()), s};
+  mera::ir::Layout layout;
+  // Default layout allocations
+  switch (shape.size()) {
+    case 4: layout = mera::ir::layout::NCHW; break;
+    case 3: layout = mera::ir::layout::NHW; break;
+    case 2: layout = mera::ir::layout::HW; break;
+    case 1: layout = mera::ir::layout::W; break;
+    case 0: layout = mera::ir::layout::x; break;
+    default: LOG(FATAL) << "Unsupported rank " << shape.size();
+  }
+  // Don't allow rank 0 shapes
+  if (shape.size() == 0) {
+    shape.push_back(1);
+  }
+  return mera::ir::Shape{shape, layout};
+}
+
+mera::ir::Shape ExpandTo4D(const mera::ir::Shape &shape) {
+  if (shape.rank == 4) {
+    return shape;
+  }
+  CHECK_LT(shape.rank, 4) << "Shapes with dim > 4 not allowed";
+  mera::ir::Shape ret = shape;
+  if (shape.rank == 3) {
+    // XHW -> XHWX
+    ret.rank = 4;
+    ret.shape[3] = 1;
+    ret.layout = mera::ir::layout::NHWC;
+  } else {
+    CHECK(false) << "Unhandled ExpandTo4d rank: " << shape.rank;
+  }
+  return ret;
 }
 
 mera::ir::Shape GetShapeNchw(const Type& type) {
@@ -80,7 +111,7 @@ mera::ir::Shape GetShapeNchw(const Type& type) {
   CHECK_EQ(shape_nhwc.rank, 4) << "Only 4D shapes allowed";
   return mera::ir::Shape{
     {shape_nhwc.shape[0], shape_nhwc.shape[3], shape_nhwc.shape[1], shape_nhwc.shape[2]},
-    shape_nhwc.rank, shape_nhwc.size};
+    mera::ir::layout::NCHW};
 }
 
 } // namespace tvm::relay::contrib

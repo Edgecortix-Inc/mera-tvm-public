@@ -61,7 +61,7 @@ class BuildConfig(object):
         "compiler_workers": 7,
         "sim_freq_mhz" : 800,
         "manual_sg_merge_map" : "",
-        "use_legacy_sg_cutting": "false",
+        "cutting_type": "",
         "batch_cutting_factor": 1,
         "scheduler_config": {
             "mode": "Fast",
@@ -192,7 +192,8 @@ class IsComputeIntensiveGraph(ExprVisitor):
                 "image.resize2d",
                 "mean",
                 "nn.conv2d",
-                "nn.conv2d_transpose"
+                "nn.conv2d_transpose",
+                "nn.dense"
             ]
         )
         if isinstance(call.op, tir.op.Op):
@@ -495,14 +496,14 @@ def build_for_tflite(mod, params, host_arch="x86", output_dir=None):
         aux_config={"weight_layout": "HWIO"},
     )
 
-def __run_passes_core(mod, params, target, host_arch, c_cfg, arch_cfg, aux_config, compiler_name):
+def __run_passes_core(mod, params, target, host_arch, c_cfg, arch_cfg, aux_config, compiler_name, pat_table_name):
     if host_arch == "x86":
         target_tvm = "llvm -mcpu=core-avx2"
     else:
         assert host_arch == "arm"
         target_tvm = "llvm -device=arm_cpu -mtriple=aarch64-linux-gnu -mattr=+neon"
     assert get_global_func(f"relay.ext.{compiler_name}")
-    pattern_table = get_pattern_table(compiler_name)
+    pattern_table = get_pattern_table(pat_table_name)
 
     if params:
         mod["main"] = bind_params_by_name(mod["main"], params)
@@ -593,12 +594,14 @@ def __run_passes_core(mod, params, target, host_arch, c_cfg, arch_cfg, aux_confi
 
 def build_fp32(mod, params, target, host_arch="x86", output_dir = None):
     """Build in fp32 precision and NHWC/IOHW layout"""
-    if target not in ['Quantizer', 'Interpreter', 'InterpreterHwBf16']:
+    if target not in ['Quantizer', 'Interpreter', 'InterpreterHwBf16', 'InterpreterBf16', 'SimulatorBf16']:
         raise ValueError(f'Unsupported target for fp32 MERA deployment: {target}')
-    cfg = BuildConfig()
-    cfg.compiler_config['target'] = target
-    ccfg_str, arch_str = parse_config(cfg)
-    json, lib, new_params, new_mod = __run_passes_core(mod, params, target, host_arch, ccfg_str, arch_str, {}, "mera_fp32")
+    cfg = BuildConfig.current
+    assert cfg.compiler_config["target"] is not None
+    ccfg_str, arch_str = _set_config(cfg)
+
+    json, lib, new_params, new_mod = __run_passes_core(mod, params, target, host_arch, ccfg_str, arch_str, {}, "mera_fp32",
+        "mera_fp32_quantizer" if target == "Quantizer" else "mera_fp32")
     if output_dir:
         # Export data to output dir
         if host_arch == "x86":

@@ -136,7 +136,7 @@ mera::ir::Shape GetNCHWOutputShape(const mera::ir::Shape& orig_shape, const std:
     // Need to convert output shape from NHWC to NCHW
     auto nchw_shape = {orig_shape.shape[0], orig_shape.shape[3], orig_shape.shape[1],
                        orig_shape.shape[2]};
-    return mera::ir::Shape{nchw_shape, orig_shape.rank, orig_shape.size};
+    return mera::ir::Shape{nchw_shape, mera::ir::layout::NCHW};
   }
   return orig_shape;
 }
@@ -360,7 +360,7 @@ class Compiler {
 
           const auto out_shape1d = GetShape(call->checked_type());
           const mera::ir::Shape out_shape{
-            {out_shape1d.shape[0], out_shape1d.shape[1], 1, 1}, 4, out_shape1d.shape[0] * out_shape1d.shape[1]};
+            {out_shape1d.shape[0], out_shape1d.shape[1], 1, 1}, mera::ir::layout::NCHW};
           return {graph.Add<mera::ir::Fc>("Fc", input.type, out_shape, input,
                                           weights, dense_input_scale, dense_input_zero_point, dense_weight_scale,
                                           dense_weight_zero_point, bias, output_scale, output_zero_point)};
@@ -378,7 +378,7 @@ class Compiler {
           CHECK_EQ(input_tensor_in.size(), 1);
           const auto& input(input_tensor_in[0]);
           const mera::ir::Shape out_shape{
-            {input.shape.shape[0], input.shape.shape[1], 1, 1}, 4, input.shape.shape[0] * input.shape.shape[1]
+            {input.shape.shape[0], input.shape.shape[1], 1, 1}, mera::ir::layout::NCHW
           };
           return {graph.Add<mera::ir::AvgPooling2d>("AvgPooling2d", input.type, out_shape, input)};
         } else if (name == "mera.mean") {
@@ -406,7 +406,7 @@ class Compiler {
           const auto& input(input_tensor_in[0]);
 
           const mera::ir::Shape out_shape{
-            {input.shape.shape[0], input.shape.shape[1], 1, 1}, 4, input.shape.shape[0] * input.shape.shape[1]
+            {input.shape.shape[0], input.shape.shape[1], 1, 1}, mera::ir::layout::NCHW
           };
           return {graph.Add<mera::ir::Mean>("Mean", input.type,
             out_shape, input, tensor_in_scale_v, tensor_in_zp_v, tensor_out_scale_v, tensor_out_zp_v)};
@@ -482,7 +482,7 @@ class Compiler {
           auto rhs_shape = inputs[1].shape;
           if (rhs_shape.shape.size() == 4 && rhs_shape.size == rhs_shape.shape[1]) {
             // This case happens when the original graph is NHWC
-            mera::ir::Shape rhs_new_shape = {{rhs_shape.shape[1]}, 1, rhs_shape.shape[1]};
+            mera::ir::Shape rhs_new_shape = {{rhs_shape.shape[1]}, mera::ir::layout::C};
             mera::ir::Tensor rhs = {inputs[1].type, rhs_new_shape, inputs[1].id};
             return {graph.Add<mera::ir::BiasAdd>("BiasAdd", inputs[0].type, shape, inputs[0], rhs)};
           }
@@ -600,8 +600,8 @@ class Compiler {
         } else if (IsOp(call, "image.resize2d")) {
           const auto* attr = GetAttrChecked<Resize2DAttrs>(call);
           const auto input = inputs[0];
-          const auto input_scale = graph.AddFloatVec(std::vector<float>(1, 1.0));
-          const auto input_zero_point = graph.AddInt32Vec(std::vector<int32_t>(1, 0));
+          const auto input_scale = graph.AddFloatVec(std::vector<float>(1, 1.0), mera::ir::layout::x);
+          const auto input_zero_point = graph.AddInt32Vec(std::vector<int32_t>(1, 0), mera::ir::layout::x);
           const auto method = attr->method;
           std::string node_name;
           if (method == "nearest_neighbor") {
@@ -640,8 +640,7 @@ class Compiler {
 
           // Inherit the shape from the input with the channels of the output
           const mera::ir::Shape out_shape{
-            {data[0].shape.shape[0], nchw_depth_sum, data[0].shape.shape[2], data[0].shape.shape[3]}, 4,
-            data[0].shape.shape[0] * nchw_depth_sum * data[0].shape.shape[2] * data[0].shape.shape[3]};
+            {data[0].shape.shape[0], nchw_depth_sum, data[0].shape.shape[2], data[0].shape.shape[3]}, mera::ir::layout::NCHW};
           return {graph.Add<mera::ir::Concatenate>("Concatenate", dtype, out_shape, in_tensors, axis)};
         } else {
           LOG(FATAL) << "Compiler Unsupported operator: " << AsText(call->op, false);
@@ -697,7 +696,14 @@ class Compiler {
         const int elements = std::accumulate(int_shape.begin(), int_shape.end(), 1,
                                              [](auto acc, auto val) { return acc * val; });
 
-        const auto mera_shape = mera::ir::Shape{convert_shape(int_shape), int(shape.size()), elements};
+        mera::ir::Layout mera_layout;
+        switch (int_shape.size()) {
+          case 4: mera_layout = mera::ir::layout::OIHW; break; // Conv weights
+          case 1: mera_layout = mera::ir::layout::C; break; // Conv Biases
+          case 0: mera_layout = {}; break;
+          default: LOG(FATAL) << "Unhandled rank for layout: " << int_shape.size();
+        }
+        const auto mera_shape = mera::ir::Shape{convert_shape(int_shape), mera_layout};
 
         if (constant->data->dtype.code == kDLFloat && constant->data->dtype.bits == 32) {
           const auto* ptr = static_cast<float*>(constant->data->data);
@@ -814,7 +820,7 @@ class MeraModuleCodeGen {
     input.shape = shape;
     input.strides = nullptr;
     input.byte_offset = 0;
-    bool interpreter = mera_arch.empty() ? true : false;
+    bool interpreter = true; // TODO - Filter by target
     const auto* pf = runtime::Registry::Get("runtime.module.mera_module_create_empty");
     return (*pf)(&input, interpreter, func_name);
   }
@@ -861,9 +867,16 @@ runtime::Module CompileModuleFp32(const ObjectRef &ref) {
     const auto* pf = runtime::Registry::Get("runtime.module.mera_quantizer_create");
     CHECK_NOTNULL(pf);
     return (*pf)(&input, func_name);
-  } else if (cdgen_cfg->mera_target == "Interpreter" || cdgen_cfg->mera_target == "InterpreterHwBf16") {
+  } else if (cdgen_cfg->mera_target == "Interpreter"
+      || cdgen_cfg->mera_target == "InterpreterHwBf16" || cdgen_cfg->mera_target == "InterpreterBf16") {
     const auto* pf = runtime::Registry::Get("runtime.module.mera_module_create_empty");
     CHECK_NOTNULL(pf);
+    return (*pf)(&input, true, func_name);
+  } else if (cdgen_cfg->mera_target == "SimulatorBf16") {
+    const auto* pf = runtime::Registry::Get("runtime.module.mera_module_create_empty");
+    CHECK_NOTNULL(pf);
+    CHECK(!cdgen_cfg->mera_arch.empty());
+    CHECK(!cdgen_cfg->mera_ccfg.empty());
     return (*pf)(&input, true, func_name);
   } else {
     CHECK(false) << "Unknown Interpreter target for fp32 MERA: '" << cdgen_cfg->mera_target << "'";
@@ -907,7 +920,7 @@ runtime::Module CompileModuleQuantized(const ObjectRef &ref) {
   input.shape = shape;
   input.strides = nullptr;
   input.byte_offset = 0;
-  bool interpreter = mera_arch.empty();
+  bool interpreter = true; // TODO - Filter by target.
   const auto* pf = runtime::Registry::Get("runtime.module.mera_module_create_empty");
   return (*pf)(&input, interpreter, func_name);
 }

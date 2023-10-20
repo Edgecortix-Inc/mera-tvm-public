@@ -55,6 +55,21 @@ static inline mera::ir::Shape GetShapeNchw(const IRContext &ir) {
   return GetShapeNchw(ir.GetRootCall());
 }
 
+static inline mera::ir::Shape GetShape(const IRContext &ir) {
+  return GetShape(ir.GetRootCall());
+}
+
+/**
+ * @brief Parses the output shape and, if the tensor is 4D, converts it to NCHW
+ */
+static inline mera::ir::Shape GetShapeNchwMultiDim(const IRContext &ir) {
+  auto shape = GetShape(ir.GetRootCall());
+  if (shape.rank == 4) {
+    return GetShapeNchw(ir.GetRootCall());
+  }
+  return shape;
+}
+
 MeraCompilerConfig GetMeraCompilerConfig() {
   auto cfg = transform::PassContext::Current()->GetConfig<MeraCompilerConfig>("relay.ext.mera.options");
   return cfg.value_or(AttrsWithDefaultValues<MeraCompilerConfig>());
@@ -124,6 +139,13 @@ struct MeraCompilerVisitor : public backend::MemoizedExprTranslator<TensorVec_t>
     T *ptr = static_cast<T*>(data);
     if (parse_mode == COPY) {
       return std::vector<T>(ptr, ptr + shape.size);
+      if (shape.rank == 1) {
+        shape.layout = mera::ir::layout::C;
+      } else if (shape.rank == 2) {
+        shape.layout = mera::ir::layout::HW;
+      } else {
+        LOG(FATAL) << "Unsupported rank " << shape.rank;
+      }
     } else if (parse_mode == WEIGHT_SWAP_LAYOUT) {
       // Convert from HWIO to OIHW
       CHECK_EQ(shape.rank, 4);
@@ -143,6 +165,7 @@ struct MeraCompilerVisitor : public backend::MemoizedExprTranslator<TensorVec_t>
         }
       }
       shape.shape = {O, I, H, W};
+      shape.layout = mera::ir::layout::OIHW;
       return ret;
     } else {
       LOG(FATAL) << "Unsupported constant parse mode " << parse_mode;
@@ -200,7 +223,11 @@ void MeraCompilerBase::Compile(const tvm::relay::Function &func) {
   for (auto &param : func->params) {
     const auto name(param->name_hint());
     const auto type(param->checked_type());
-    const auto shape = GetShapeNchw(type);
+    auto shape = GetShape(type);
+    if (shape.rank == 4) {
+      // Auto-convert 4D tensors to NCHW
+      shape = GetShapeNchw(type);
+    }
     scope[name] = graph_.Add<mera::ir::Var>(name, GetType(type), shape);
   }
 
@@ -221,6 +248,72 @@ mera::ir::Tensor IRContext::IRTraverse::CompileConstant(unsigned arg_idx, consta
   visitor->parse_mode = COPY;
   CHECK_EQ(tensors.size(), 1);
   return tensors[0];
+}
+
+static TensorVec_t EmitAttentionNode(const std::vector<mera::ir::Tensor> &inputs, IRContext &ir, mera::ir::Graph &graph,
+    bool const_query = false, bool has_mask = false) {
+  auto out_shape = GetShape(ir);
+  const int embed_dim = out_shape.shape[out_shape.rank - 1];
+  const int batch = out_shape.rank == 3 ? out_shape.shape[0] : 1;
+  const int query_length = out_shape.rank == 3 ? out_shape.shape[1] : out_shape.shape[0];
+
+  auto itt = ir.Traverse()[0][0][0];
+  CHECK(itt.IsOp("nn.batch_matmul"));
+  const auto val_shape = GetShape(itt.GetCall()->args[1].as<CallNode>()->checked_type());
+  CHECK_EQ(val_shape.rank, 3);
+  // val_shape will have the form of [B * num_heads, dim, L]
+  CHECK(val_shape.shape[0] % batch == 0);
+  const int num_heads = val_shape.shape[0] / batch;
+  const int dim = val_shape.shape[1];
+  const int seq_length = val_shape.shape[2];
+  CHECK_EQ(num_heads * dim, embed_dim) << "embed_dim(" << embed_dim << ") must be a multiple of dim_x(" << dim
+    << ") times num_heads(" << num_heads << ")";
+
+  int slice_value, slice_query, slice_key;
+  mera::ir::Tensor query_tensor, key_tensor, value_tensor;
+  if (const_query) {
+    CHECK_EQ(inputs.size(), 2); // Query is a constant
+    // In this case value and key should come from the same tensor
+    CHECK_EQ(inputs[0].id, inputs[1].id);
+    std::tie(slice_query, slice_key, slice_value) = std::make_tuple(0, 0, 1);
+    // Search for first matmul of constant query with key
+    auto itt = ir.Traverse()[0][0][0][0][0][0];
+    CHECK(itt.IsOp("nn.batch_matmul"));
+    query_tensor = itt.CompileConstant(0);
+    key_tensor = inputs[0];
+    value_tensor = inputs[1];
+  } else if (inputs.size() == 3) {
+    // Source are 3 distinct var connections (even if they come from the same one)
+    typedef enum { QUERY = 0, KEY = 1, VALUE = 2 } attn_idx_t;
+    const std::set<std::string> source_inputs{inputs[KEY].id, inputs[QUERY].id, inputs[VALUE].id};
+    if (source_inputs.size() == 1) {
+      // Case when all three inputs come from same tensor: assign slices in Q,K,V order
+      std::tie(slice_query, slice_key, slice_value) = std::make_tuple(0, 1, 2);
+    } else if (source_inputs.size() == 2) {
+      // We support the case of V and K from same source as part of decoder network
+      CHECK_EQ(inputs[VALUE].id, inputs[KEY].id);
+      std::tie(slice_query, slice_key, slice_value) = std::make_tuple(0, 0, 1);
+    } else {
+      // Inputs are all different tensors, don't slice the inputs
+      std::tie(slice_query, slice_key, slice_value) = std::make_tuple(0, 0, 0);
+    }
+    query_tensor = inputs[QUERY];
+    key_tensor = inputs[KEY];
+    value_tensor = inputs[VALUE];
+  } else if (inputs.size() == 1) {
+    // Source is a single input: assign slices in Q,K,V order
+    std::tie(slice_query, slice_key, slice_value) = std::make_tuple(0, 1, 2);
+    query_tensor = inputs[0];
+    key_tensor = inputs[0];
+    value_tensor = inputs[0];
+  } else {
+    LOG(FATAL) << "Unsupported attention source case.";
+  }
+
+  // Reorder input tensors Q,K,V to MERA IR V,Q,K
+  return TensorVec_t{graph.Add<mera::ir::Attention>("Attention", mera::ir::DataType::Float32, out_shape,
+    value_tensor, query_tensor, key_tensor, dim, num_heads, seq_length, query_length,
+    slice_value, slice_query, slice_key, has_mask, const_query)};
 }
 
 /*
@@ -253,7 +346,7 @@ MeraFp32Compiler::MeraFp32Compiler(const std::string &id, mera::ir::Module &modu
     }},
     {"mera_fp32.relu", [&](const auto &inputs, auto &ir) {
       CHECK_EQ(inputs.size(), 1);
-      return TensorVec_t{graph_.Add<mera::ir::ReLU>("ReLU", kType, GetShapeNchw(ir), inputs[0])};
+      return TensorVec_t{graph_.Add<mera::ir::ReLU>("ReLU", kType, GetShapeNchwMultiDim(ir), inputs[0])};
     }},
     {"mera_fp32.leaky_relu", [&](const auto &inputs, auto &ir) {
       CHECK_EQ(inputs.size(), 1);
@@ -262,7 +355,7 @@ MeraFp32Compiler::MeraFp32Compiler(const std::string &id, mera::ir::Module &modu
     }},
     {"mera_fp32.silu", [&](const auto &inputs, auto &ir) {
       CHECK_EQ(inputs.size(), 1);
-      return TensorVec_t{graph_.Add<mera::ir::SiLUFp>("SiLU", kType, GetShapeNchw(ir), inputs[0])};
+      return TensorVec_t{graph_.Add<mera::ir::SiLUFp>("SiLU", kType, GetShapeNchwMultiDim(ir), inputs[0])};
     }},
     {"mera_fp32.hswish", [&](const auto &inputs, auto &ir) {
       CHECK_EQ(inputs.size(), 1);
@@ -310,7 +403,12 @@ MeraFp32Compiler::MeraFp32Compiler(const std::string &id, mera::ir::Module &modu
     }},
     {"mera_fp32.res_add", [&](const auto &inputs, auto &ir) {
       CHECK_EQ(inputs.size(), 2);
-      return TensorVec_t{graph_.Add<mera::ir::AddOp>("Add", kType, GetShapeNchw(ir), inputs[0], inputs[1])};
+      return TensorVec_t{graph_.Add<mera::ir::AddOp>("Add", kType, GetShapeNchwMultiDim(ir), inputs[0], inputs[1])};
+    }},
+    {"mera_fp32.res_add_constant", [&](const auto &inputs, auto &ir) {
+      CHECK_EQ(inputs.size(), 1);
+      const auto data = ir.Traverse().CompileConstant(0);
+      return TensorVec_t{graph_.Add<mera::ir::AddOp>("Add", kType, GetShapeNchwMultiDim(ir), data, inputs[0])};
     }},
     {"mera_fp32.avg_pool2d", [&](const auto &inputs, auto &ir) {
       CHECK_EQ(inputs.size(), 1);
@@ -331,12 +429,99 @@ MeraFp32Compiler::MeraFp32Compiler(const std::string &id, mera::ir::Module &modu
       return TensorVec_t{graph_.Add<mera::ir::UpsamplingFp>("Upsampling", kType, GetShapeNchw(ir), inputs[0],
         attrs->method, attrs->coordinate_transformation_mode)};
     }},
+    {"mera_fp32.upsampling_concat", [&](const auto &inputs, auto &ir) {
+      CHECK_GT(inputs.size(), 1);
+      const auto ups_attrs = AsChecked<Resize2DAttrs>(ir.GetRootCall()->attrs);
+      int axis = GetInt(AsChecked<ConcatenateAttrs>(ir.Traverse().Get(0).GetCall()->attrs)->axis);
+
+      auto out_shape = GetShapeNchw(ir);
+      int N = out_shape.shape[0];
+      int H = out_shape.shape[2];
+      int W = out_shape.shape[3];
+      std::vector<mera::ir::Tensor> cat_inputs;
+      for (const auto &input : inputs) {
+        int C = input.shape.shape[1];
+        mera::ir::Shape ups_out_shape = mera::ir::Shape{{N, C, H, W}, mera::ir::layout::NCHW};
+
+        cat_inputs.emplace_back(graph_.Add<mera::ir::UpsamplingFp>("Upsampling", kType, ups_out_shape, input,
+          ups_attrs->method, ups_attrs->coordinate_transformation_mode));
+      }
+
+      return TensorVec_t{graph_.Add<mera::ir::Concatenate>("Concatenate", kType, out_shape, cat_inputs, axis)};
+    }},
     {"mera_fp32.hardtanh", [&](const auto &inputs, auto &ir) {
       CHECK_EQ(inputs.size(), 1);
       const auto *attr = AsChecked<ClipAttrs>(ir.GetRootCall()->attrs);
       float clip_min = attr->a_min;
       float clip_max = attr->a_max;
       return TensorVec_t{graph_.Add<mera::ir::HardTanh>("HardTanh", kType, GetShapeNchw(ir), inputs[0], clip_min, clip_max)};
+    }},
+    {"mera_fp32.gelu", [&](const auto &inputs, auto &ir) {
+      CHECK_EQ(inputs.size(), 1);
+      return TensorVec_t{graph_.Add<mera::ir::GELU>("GELU", kType, GetShape(ir), inputs[0])};
+    }},
+    {"mera_fp32.sigmoid", [&](const auto &inputs, auto &ir) {
+      CHECK_EQ(inputs.size(), 1);
+      return TensorVec_t{graph_.Add<mera::ir::Sigmoid>("Sigmoid", kType, GetShape(ir), inputs[0])};
+    }},
+    {"mera_fp32.layer_norm", [&](const auto &inputs, auto &ir) {
+      CHECK_EQ(inputs.size(), 1);
+
+      mera::ir::Tensor bias, weight;
+      const auto out_shape = GetShape(ir);
+      bool has_bias = true;
+      auto irt = ir.Traverse();
+      if (ir.Traverse().IsOp("add")) {
+        bias = ir.Traverse().CompileConstant(1);
+        weight = irt[0].CompileConstant(1);
+      } else {
+        // Disabled bias.
+        has_bias = false;
+        bias = graph_.AddFloatVec(std::vector<float>(out_shape.shape[2], 0.0), mera::ir::layout::W);
+        weight = irt.CompileConstant(1);
+      }
+
+      return TensorVec_t{graph_.Add<mera::ir::LayerNorm>("LayerNorm", kType, out_shape, inputs[0], weight, bias, has_bias)};
+    }},
+    {"mera_fp32.matmul", [&](const auto &inputs, auto &ir) {
+      CHECK_EQ(inputs.size(), 1);
+      mera::ir::Tensor data;
+      if (ir.Traverse().IsOp("nn.dense")) {
+        data = ir.Traverse().CompileConstant(1);
+      } else {
+        data = ir.Traverse()[0].CompileConstant(1);
+      }
+      CHECK_EQ(data.shape.rank, 2) << "Matmul data has to be a 2D tensor.";
+
+      return TensorVec_t{graph_.Add<mera::ir::MatMul>("MatMul", kType, GetShape(ir), inputs[0], data)};
+    }},
+    {"mera_fp32.attention", [&](const auto &inputs, auto &ir) {
+      return EmitAttentionNode(inputs, ir, graph_);
+    }},
+    {"mera_fp32.attention_sliced", [&](const auto &inputs, auto &ir) {
+      return EmitAttentionNode(inputs, ir, graph_);
+    }},
+    {"mera_fp32.attention_const_query", [&](const auto &inputs, auto &ir) {
+      constexpr static bool kConstQuery = true;
+      return EmitAttentionNode(inputs, ir, graph_, kConstQuery);
+    }},
+    {"mera_fp32.masked_attention", [&](const auto &inputs, auto &ir) {
+      constexpr static bool kHasMask = true;
+      return EmitAttentionNode(inputs, ir, graph_, false, kHasMask);
+    }},
+    {"mera_fp32.3d_add_broadcast", [&](const auto &inputs, auto &ir) {
+      CHECK_EQ(inputs.size(), 1);
+      const auto bias = ir.Traverse().CompileConstant(0);
+      return TensorVec_t{graph_.Add<mera::ir::BiasAdd>("BiasAdd", kType, GetShape(ir), inputs[0], bias)};
+    }},
+    {"mera_fp32.2d_add_broadcast", [&](const auto &inputs, auto &ir) {
+      CHECK_EQ(inputs.size(), 1);
+      const auto bias = ir.Traverse()[0].CompileConstant(1);
+      return TensorVec_t{graph_.Add<mera::ir::BiasAdd>("BiasAdd", kType, GetShape(ir), inputs[0], bias)};
+    }},
+    {"mera_fp32.transpose_nop", [&](const auto &inputs, auto &ir) {
+      // This is a captured NOP operation. Return pass-through
+      return inputs;
     }},
   }) {};
 
