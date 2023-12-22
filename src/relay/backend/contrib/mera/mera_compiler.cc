@@ -137,15 +137,11 @@ struct MeraCompilerVisitor : public backend::MemoizedExprTranslator<TensorVec_t>
   template<typename T>
   std::vector<T> ProcessConstant(void *data, mera::ir::Shape &shape) {
     T *ptr = static_cast<T*>(data);
-    if (parse_mode == COPY) {
-      return std::vector<T>(ptr, ptr + shape.size);
-      if (shape.rank == 1) {
-        shape.layout = mera::ir::layout::C;
-      } else if (shape.rank == 2) {
-        shape.layout = mera::ir::layout::HW;
-      } else {
-        LOG(FATAL) << "Unsupported rank " << shape.rank;
+    if (parse_mode == COPY || parse_mode == FLATTEN_W) {
+      if (parse_mode == FLATTEN_W) {
+        shape = mera::ir::Shape{{shape.size}, mera::ir::layout::W};
       }
+      return std::vector<T>(ptr, ptr + shape.size);
     } else if (parse_mode == WEIGHT_SWAP_LAYOUT) {
       // Convert from HWIO to OIHW
       CHECK_EQ(shape.rank, 4);
@@ -471,14 +467,14 @@ MeraFp32Compiler::MeraFp32Compiler(const std::string &id, mera::ir::Module &modu
       const auto out_shape = GetShape(ir);
       bool has_bias = true;
       auto irt = ir.Traverse();
-      if (ir.Traverse().IsOp("add")) {
-        bias = ir.Traverse().CompileConstant(1);
-        weight = irt[0].CompileConstant(1);
+      if (ir.Traverse().MoveIf("cast").IsOp("add")) {
+        bias = ir.Traverse().MoveIf("cast").CompileConstant(1, FLATTEN_W);
+        weight = irt.MoveIf("cast")[0].CompileConstant(1, FLATTEN_W);
       } else {
         // Disabled bias.
         has_bias = false;
         bias = graph_.AddFloatVec(std::vector<float>(out_shape.shape[2], 0.0), mera::ir::layout::W);
-        weight = irt.CompileConstant(1);
+        weight = irt.MoveIf("cast").CompileConstant(1, FLATTEN_W);
       }
 
       return TensorVec_t{graph_.Add<mera::ir::LayerNorm>("LayerNorm", kType, out_shape, inputs[0], weight, bias, has_bias)};
@@ -520,6 +516,10 @@ MeraFp32Compiler::MeraFp32Compiler(const std::string &id, mera::ir::Module &modu
       return TensorVec_t{graph_.Add<mera::ir::BiasAdd>("BiasAdd", kType, GetShape(ir), inputs[0], bias)};
     }},
     {"mera_fp32.transpose_nop", [&](const auto &inputs, auto &ir) {
+      // This is a captured NOP operation. Return pass-through
+      return inputs;
+    }},
+    {"mera_fp32.cast_nop", [&](const auto &inputs, auto &ir) {
       // This is a captured NOP operation. Return pass-through
       return inputs;
     }},

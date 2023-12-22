@@ -38,7 +38,7 @@ namespace tvm::relay::contrib {
 using TensorVec_t = std::vector<mera::ir::Tensor>;
 using Scope_t = std::map<std::string, mera::ir::Tensor>;
 
-typedef enum {COPY, WEIGHT_SWAP_LAYOUT} constant_parse_mode_t;
+typedef enum {COPY, WEIGHT_SWAP_LAYOUT, FLATTEN_W} constant_parse_mode_t;
 
 class IRContext {
   using MemoVisitor = backend::MemoizedExprTranslator<TensorVec_t>;
